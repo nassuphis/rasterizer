@@ -202,8 +202,8 @@ def bucket_by_radius_parallel(r_px: np.ndarray, r_min: int, r_max: int):
 
 def project_to_canvas(z: np.ndarray, pix: int, margin_frac: float):
     if z.size<1: return np.empty(0,dtype=np.int32), np.empty(0,dtype=np.int32)
-    #half  = np.max(np.abs(z)) * (1.0 + 2.0 * margin_frac)
-    half = (0.5*max(np.ptp(z.real),np.ptp(z.imag))) * (1.0 + 2.0 * margin_frac)
+    half  = np.max(np.abs(z)) * (1.0 + 2.0 * margin_frac)
+    #half = (0.5*max(np.ptp(z.real),np.ptp(z.imag))) * (1.0 + 2.0 * margin_frac)
     span  = 2.0 * half
     if span<1e-10: span=1
     px_per = (int(pix) - 1) / span
@@ -222,6 +222,40 @@ def render_to_canvas(z: np.ndarray, pix: int, margin_frac: float):
 # ========================================
 # image output
 # ========================================
+
+def np_to_vips_rgb_u8(arr: np.ndarray) -> vips.Image:
+    """
+    Convert an RGB numpy array to a pyvips Image.
+
+    Accepts:
+      - H x W x 3  (preferred)
+      - 3 x H x W  (will be transposed to H x W x 3)
+    """
+    if arr.ndim != 3:
+        raise ValueError(f"Expected 3D RGB array, got shape {arr.shape}")
+
+    # Accept either HxWx3 or 3xHxW
+    if arr.shape[2] == 3:
+        H, W, C = arr.shape
+        arr_rgb = arr
+    elif arr.shape[0] == 3:
+        C, H, W = arr.shape
+        arr_rgb = np.transpose(arr, (1, 2, 0))
+    else:
+        raise ValueError(f"Last/first dimension must be 3 channels, got shape {arr.shape}")
+
+    if C != 3:
+        raise ValueError(f"Expected 3 channels, got {C}")
+
+    if arr_rgb.dtype != np.uint8:
+        arr_rgb = np.clip(arr_rgb, 0, 255).astype(np.uint8, copy=False)
+
+    # Ensure contiguous memory for pyvips
+    arr_rgb = np.ascontiguousarray(arr_rgb)
+
+    # pyvips expects interleaved RGB, bands=3
+    return vips.Image.new_from_memory(arr_rgb.data, W, H, 3, "uchar")
+
 
 def np_to_vips_gray_u8(arr: np.ndarray) -> vips.Image:
     if arr.dtype != np.uint8:
@@ -368,6 +402,53 @@ def add_rounded_passepartout_bilevel_pct(
     # enforce bilevel (safe even if already 0/255)
     return (out > 127).ifthenelse(255, 0)
 
+def save_png_rgb(
+    rgb: np.ndarray,
+    out_path: str,
+    invert: bool = False,
+    footer_text: str | None = None,
+    *,
+    footer_pad_lr_px: int = 48,
+    footer_dpi: int = 300,
+) -> None:
+    """
+    Save an 8-bit RGB PNG from a numpy array.
+
+    rgb:
+        H x W x 3 or 3 x H x W, dtype uint8 (or anything coercible to uint8).
+
+    invert:
+        If True, replace each channel with 255 - value (simple negative).
+
+    footer_text:
+        Optional text label rendered at the bottom using add_footer_label().
+    """
+    base = np_to_vips_rgb_u8(rgb)
+
+    if invert:
+        base = 255 - base
+
+    if footer_text:
+        # add_footer_label works on 1-band; for RGB, it will broadcast the mask
+        base = add_footer_label(
+            base,
+            footer_text,
+            pad_lr_px=footer_pad_lr_px,
+            dpi=footer_dpi,
+            align="centre",
+            invert=False,  # if you want "invert" effect, apply via invert=True above
+        )
+
+    # PNG, 8-bit RGB
+    base.write_to_file(
+        out_path,
+        compression=1,
+        effort=1,
+        interlace=False,
+        strip=True,
+        # bitdepth default is 8 for uchar; don't override it here
+    )
+
 def save_png_bilevel(
     canvas: np.ndarray,
     out_path: str,
@@ -426,7 +507,93 @@ def pad_to_square(im: vips.Image, px: int) -> vips.Image:
     canvas = vips.Image.black(px, px)
     return canvas.insert(im, dx, dy)
 
+def save_mosaic_png_rgb(
+    tiles: list[np.ndarray],
+    titles: list[str] | None,
+    *,
+    cols: int,
+    gap: int,
+    out_path: str,
+    invert: bool = False,
+    footer_pad_lr_px: int = 48,
+    footer_dpi: int = 300,
+    thumbnail: int | None = None,
+) -> None:
+    """
+    Compose a mosaic from RGB numpy tiles (H x W x 3 or 3 x H x W each) and
+    save as 8-bit RGB PNG.
 
+    All tiles must have the same height/width/channels. Titles (if provided)
+    are drawn as footers per tile, like in save_mosaic_png_bilevel.
+    """
+    if not tiles:
+        raise ValueError("No tiles provided")
+
+    # Normalize titles (same logic as bilevel)
+    if titles is None:
+        titles = [None] * len(tiles)
+    elif len(titles) == 1 and len(tiles) > 1:
+        titles = titles * len(tiles)
+    elif len(titles) != len(tiles):
+        raise ValueError("Length of 'titles' must be 1 or match number of tiles")
+
+    # Convert first tile to VIPS, check size/bands
+    first = np_to_vips_rgb_u8(tiles[0])
+    tile_h, tile_w, bands = first.height, first.width, first.bands
+
+    vtiles: list[vips.Image] = []
+    for arr, title in zip(tiles, titles):
+        vt = np_to_vips_rgb_u8(arr)
+
+        if vt.width != tile_w or vt.height != tile_h or vt.bands != bands:
+            raise ValueError(
+                f"All RGB tiles must have the same size/bands; "
+                f"expected ({tile_w}x{tile_h},{bands}), "
+                f"got ({vt.width}x{vt.height},{vt.bands})"
+            )
+
+        if title:
+            vt = add_footer_label(
+                vt,
+                title,
+                pad_lr_px=footer_pad_lr_px,
+                dpi=footer_dpi,
+                align="centre",
+                invert=False,
+            )
+        vtiles.append(vt)
+
+    n = len(vtiles)
+    rows = math.ceil(n / cols)
+    W = cols * tile_w + (cols - 1) * gap
+    H = rows * tile_h + (rows - 1) * gap
+
+    # Black RGB canvas
+    base = vips.Image.black(W, H).new_from_image([0] * bands)
+
+    # Composite tiles row-major
+    for i, vt in enumerate(vtiles):
+        r, c = divmod(i, cols)
+        x = c * (tile_w + gap)
+        y = r * (tile_h + gap)
+        base = base.draw_image(vt, x, y)
+
+    if invert:
+        base = 255 - base
+
+    if thumbnail:
+        base_thumb = base.thumbnail_image(thumbnail)
+        base_thumb.write_to_file(out_path)
+    else:
+        base.write_to_file(
+            out_path,
+            compression=1,
+            effort=1,
+            interlace=False,
+            strip=True,
+        )
+
+        
 def save_mosaic_png_bilevel(
     tiles: list[np.ndarray],
     titles: list[str] | None,
