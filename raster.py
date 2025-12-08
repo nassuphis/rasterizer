@@ -1,4 +1,5 @@
 # raster.py
+import os
 import math
 import numpy as np
 from numba import njit, prange
@@ -401,6 +402,40 @@ def add_rounded_passepartout_bilevel_pct(
 
     # enforce bilevel (safe even if already 0/255)
     return (out > 127).ifthenelse(255, 0)
+
+def add_suffix_number(path: str, n: int, width: int = 5) -> str:
+    base, ext = os.path.splitext(path)
+    return f"{base}_{n:0{width}d}{ext}"
+
+def save_jpg_rgb(
+    rgb: np.ndarray,
+    out_path: str,
+    invert: bool = False,
+    footer_text: str | None = None,
+    *,
+    footer_pad_lr_px: int = 48,
+    footer_dpi: int = 300,
+    quality: int = 95,
+    progressive: bool = True,
+) -> None:
+    base = np_to_vips_rgb_u8(rgb)
+    if invert: base = base ^ 255
+    if footer_text:
+        base = add_footer_label(
+            base,
+            footer_text,
+            pad_lr_px=footer_pad_lr_px,
+            dpi=footer_dpi,
+            align="centre",
+            invert=False,  # if you want negative text, use invert=True above
+        )
+    # JPEG, 8-bit RGB
+    base.write_to_file(
+        out_path,
+        Q=int(quality),
+        strip=True,                 # drop metadata
+        interlace=bool(progressive) # progressive JPEG if True
+    )
 
 def save_png_rgb(
     rgb: np.ndarray,
