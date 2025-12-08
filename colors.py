@@ -1,4 +1,7 @@
+import math
+import numpy as np
 
+DEFAULT_GAMMA = 1
 
 _COLOR_NAME_MAP = {
     "black":      "000000",
@@ -318,8 +321,16 @@ def parse_color_spec(spec: str, default: tuple[float, float, float]) -> tuple[fl
         b = int(s[4:6], 16)
     except ValueError:
         return default
+    return float(r), float(g), float(b)
 
 COLOR_TRI_STRINGS = {
+
+    "redgold": "firebrick:black:sunset",
+    "rg": "firebrick:black:sunset",
+    "greencopper": "seagreen:black:copper",
+    "gc": "seagreen:black:copper",
+    "royalblueplatinum": "royalblue:black:platinum",
+    "bp": "royalblue:black:platinum",
     "bauhaus_primaries":  "0038A8:F5F0E6:D00000",  # (-1 deep blue, 0 warm paper, +1 poster red)
     "itten_blue_orange":  "264653:F1FAEE:E76F51",  # (-1 blue-green, 0 light neutral, +1 red-orange)
     "scientific_red_blue":"313695:F7F7F7:A50026",  # (ColorBrewer-style diverging)
@@ -1013,4 +1024,265 @@ COLOR_LONG_STRINGS = {
 COLOR_STRINGS = {}
 COLOR_STRINGS.update(COLOR_TRI_STRINGS)
 COLOR_STRINGS.update(COLOR_LONG_STRINGS)
+
+# ---------------------------------------------------------------------------
+# Color mapping: Lyapunov exponent -> RGB (schemes)
+# ---------------------------------------------------------------------------
+
+def _hist_equalize(values: np.ndarray, nbins: int = 256) -> np.ndarray:
+    """
+    Simple 1D histogram equalization on 'values', returning t in [0,1].
+
+    We use a fixed number of bins and map each value to the CDF bin
+    it falls into. This is O(N) and works well for large images.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    if values.size == 0:
+        return np.zeros_like(values, dtype=np.float64)
+
+    vmin = float(values.min())
+    vmax = float(values.max())
+
+    if (not math.isfinite(vmin)) or (not math.isfinite(vmax)) or vmax <= vmin:
+        return np.zeros_like(values, dtype=np.float64)
+
+    hist, bin_edges = np.histogram(values, bins=nbins, range=(vmin, vmax))
+    cdf = hist.cumsum().astype(np.float64)
+    if cdf[-1] <= 0.0:
+        return np.zeros_like(values, dtype=np.float64)
+    cdf /= cdf[-1]
+
+    # For each value, find its bin and pick the CDF
+    idx = np.searchsorted(bin_edges, values, side="right") - 1
+    idx = np.clip(idx, 0, nbins - 1)
+    t = cdf[idx]
+    return t
+
+
+
+
+def rgb_scheme_mh(lyap: np.ndarray, params: dict) -> np.ndarray:
+    """
+    Markus & Hess style:
+
+      λ < 0 : black  -> yellow  (periodic / order)
+      λ = 0 : black
+      λ > 0 : black  -> red or blue (chaos)
+
+    'clip' controls the symmetric |λ| range. If clip is None, auto-range.
+    """
+    arr = np.asarray(lyap, dtype=np.float64)
+    H, W = arr.shape
+    rgb = np.zeros((H, W, 3), dtype=np.uint8)
+
+    finite = np.isfinite(arr)
+    if not np.any(finite):
+        return rgb
+
+    neg_mask = finite & (arr < 0.0)
+    pos_mask = finite & (arr > 0.0)
+
+    gamma = params.get("gamma", DEFAULT_GAMMA)
+    gamma = 1 if gamma <= 0.0 else gamma
+
+    pos_spec = params.get("pos_color", "FF0000")   # red
+    zero_spec = params.get("zero_color", "000000")   # black
+    neg_spec = params.get("neg_color", "FFFF00")   # yellow
+    pos_r, pos_g, pos_b = parse_color_spec(pos_spec, (255.0, 0.0, 0.0))
+    zero_r, zero_g, zero_b = parse_color_spec(zero_spec, (0.0, 0.0, 0.0))
+    neg_r, neg_g, neg_b = parse_color_spec(neg_spec, (255.0, 255.0, 0.0))
+
+    min_neg = float(arr[neg_mask].min()) if np.any(neg_mask) else 0.0
+    max_pos = float(arr[pos_mask].max()) if np.any(pos_mask) else 0.0
+    scale = max(abs(min_neg), abs(max_pos))
+    scale = 1 if (not math.isfinite(scale)) or scale <= 0.0 else scale
+
+    # λ < 0 → black→yellow
+    if np.any(neg_mask):
+        lam_neg = np.clip(arr[neg_mask], -scale, 0.0)
+        t = np.abs(lam_neg) / scale
+        t = t ** float(gamma) if gamma != 1.0 else t
+        rgb[neg_mask, 0] = np.rint(t * neg_r + (1-t)*zero_r).astype(np.uint8)
+        rgb[neg_mask, 1] = np.rint(t * neg_g + (1-t)*zero_g).astype(np.uint8)
+        rgb[neg_mask, 2] = np.rint(t * neg_b + (1-t)*zero_b).astype(np.uint8)
+
+    # λ > 0 → black→red/blue
+    if np.any(pos_mask):
+        lam_pos = np.clip(arr[pos_mask], 0.0, scale)
+        t = lam_pos / scale
+        t = t ** float(gamma) if gamma != 1.0 else t
+        rgb[pos_mask, 0] = np.rint(t * pos_r + (1-t)*zero_r).astype(np.uint8)
+        rgb[pos_mask, 1] = np.rint(t * pos_g + (1-t)*zero_g).astype(np.uint8)
+        rgb[pos_mask, 2] = np.rint(t * pos_b + (1-t)*zero_b).astype(np.uint8)
+
+    return rgb
+
+
+def rgb_scheme_mh_eq(lyap: np.ndarray, params: dict) -> np.ndarray:
+
+    arr = np.asarray(lyap, dtype=np.float64)
+    H, W = arr.shape
+    rgb = np.zeros((H, W, 3), dtype=np.uint8)
+
+    finite = np.isfinite(arr)
+    if not np.any(finite):
+        return rgb
+
+    neg_mask = finite & (arr < 0.0)
+    pos_mask = finite & (arr > 0.0)
+
+    gamma = params.get("gamma", DEFAULT_GAMMA)
+    gamma = 1 if gamma <= 0.0 else gamma
+    nbins = int(params.get("nbins", 256))
+
+    pos_spec = params.get("pos_color", "FF0000")   # red
+    zero_spec = params.get("zero_color", "000000")   # black
+    neg_spec = params.get("neg_color", "FFFF00")   # yellow
+    pos_r, pos_g, pos_b = parse_color_spec(pos_spec, (255.0, 0.0, 0.0))
+    zero_r, zero_g, zero_b = parse_color_spec(zero_spec, (0.0, 0.0, 0.0))
+    neg_r, neg_g, neg_b = parse_color_spec(neg_spec, (255.0, 255.0, 0.0))
+
+
+    # λ < 0: equalize |λ|
+    if np.any(neg_mask):
+        vals = np.abs(arr[neg_mask])
+        t = _hist_equalize(vals, nbins=nbins)  # in [0,1]
+        t = t ** float(gamma) if gamma != 1.0 else t
+        rgb[neg_mask, 0] = np.rint(t * neg_r + (1-t)*zero_r).astype(np.uint8)
+        rgb[neg_mask, 1] = np.rint(t * neg_g + (1-t)*zero_g).astype(np.uint8)
+        rgb[neg_mask, 2] = np.rint(t * neg_b + (1-t)*zero_b).astype(np.uint8)
+
+    # λ > 0: equalize λ
+    if np.any(pos_mask):
+        vals = arr[pos_mask]
+        t = _hist_equalize(vals, nbins=nbins)  # in [0,1]
+        t = t ** float(gamma) if gamma != 1.0 else t
+        rgb[pos_mask, 0] = np.rint(t * pos_r + (1-t)*zero_r).astype(np.uint8)
+        rgb[pos_mask, 1] = np.rint(t * pos_g + (1-t)*zero_g).astype(np.uint8)
+        rgb[pos_mask, 2] = np.rint(t * pos_b + (1-t)*zero_b).astype(np.uint8)
+
+    return rgb
+
+
+def rgb_scheme_palette_eq(lyap: np.ndarray, params: dict) -> np.ndarray:
+    """
+    Colorize using a named palette from COLOR_TRI_STRINGS.
+    """
+    palette_name = params.get("palette")
+    if palette_name is None:
+        raise ValueError(
+            "params['palette'] must be set to a key in COLOR_TRI_STRINGS"
+        )
+
+    if palette_name not in COLOR_TRI_STRINGS:
+        raise KeyError(
+            f"Unknown palette {palette_name!r}. "
+            f"Available: {', '.join(sorted(COLOR_TRI_STRINGS.keys()))}"
+        )
+
+    palette_spec = COLOR_TRI_STRINGS[palette_name]
+    try:      
+        parts = palette_spec.split(":")
+        neg_spec, zero_spec, pos_spec = parts[:3]
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid COLOR_TRI_STRINGS entry for {palette_name!r}: {palette_spec!r} "
+            "(expected 'NEG:ZERO:POS')"
+        ) from exc
+
+    # Clone params so we don't mutate the caller's dict
+    sub_params = dict(params)
+    sub_params["neg_color"] = neg_spec
+    sub_params["zero_color"] = zero_spec
+    sub_params["pos_color"] = pos_spec
+
+    return rgb_scheme_mh_eq(lyap, sub_params)
+
+
+def rgb_scheme_multipoint(lyap: np.ndarray, params: dict) -> np.ndarray:
+    """
+    Colorize using N color stops between -1 and +1.
+
+    params:
+        palette : str (preferred)
+            Name of a palette in COLOR_STRINGS. Its value is a colon-
+            separated list "HEX:HEX:HEX:...". All colors are used as
+            equidistant stops in [-1, +1].
+
+        color_string : str (optional override)
+            If provided, overrides 'palette'. Same format as above.
+
+        gamma : float (optional)
+            Gamma applied to normalized coordinate in [0, 1].
+            gamma <= 0 is treated as 1 (no gamma).
+
+    Values outside [-1, +1] are clamped before mapping.
+    Non-finite entries are left black.
+    """
+    arr = np.asarray(lyap, dtype=np.float64)
+    if arr.ndim != 2:
+        raise ValueError("lyap array must be 2D (H, W)")
+
+    H, W = arr.shape
+    rgb = np.zeros((H, W, 3), dtype=np.uint8)
+
+    finite = np.isfinite(arr)
+    if not np.any(finite):
+        return rgb
+
+    # Choose source of color string
+    color_string = params.get("color_string")
+    if not color_string:
+        palette_name = params.get("palette")
+        if not palette_name:
+            raise ValueError(
+                "scheme_multipoint requires either params['palette'] "
+                "or params['color_string']"
+            )
+        try:
+            color_string = COLOR_STRINGS[palette_name]
+        except KeyError as exc:
+            raise KeyError(
+                f"Unknown palette {palette_name!r} for scheme_multipoint"
+            ) from exc
+
+    # Parse into list of RGB triples
+    specs = [s.strip() for s in color_string.split(":") if s.strip()]
+    if len(specs) < 2:
+        raise ValueError(
+            "scheme_multipoint needs at least 2 colors "
+            "in color_string / palette"
+        )
+
+    colors = []
+    for spec in specs:
+        r, g, b = parse_color_spec(spec, (0.0, 0.0, 0.0))
+        colors.append((r, g, b))
+
+    colors = np.asarray(colors, dtype=np.float64)
+    N = colors.shape[0]
+
+    # Map [-1, +1] -> [0, 1], clamp
+    vals = arr[finite]
+    t = (np.clip(vals, -1.0, 1.0) + 1.0) * 0.5  # in [0, 1]
+
+    gamma = params.get("gamma", 1)
+    gamma = 1.0 if gamma <= 0.0 else float(gamma)
+    if gamma != 1.0:
+        t = t ** gamma
+
+    # N colors => N-1 segments in [0,1]
+    segment_float = t * (N - 1)
+    idx_low = np.floor(segment_float).astype(np.int64)
+    idx_low = np.clip(idx_low, 0, N - 2)
+    frac = segment_float - idx_low
+
+    c0 = colors[idx_low]           # (M, 3)
+    c1 = colors[idx_low + 1]       # (M, 3)
+    frac = frac[:, np.newaxis]     # (M, 1) for broadcasting
+
+    rgb_vals = np.rint((1.0 - frac) * c0 + frac * c1).astype(np.uint8)
+    rgb[finite] = rgb_vals
+
+    return rgb
 
