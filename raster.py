@@ -437,6 +437,31 @@ def save_jpg_rgb(
         interlace=bool(progressive) # progressive JPEG if True
     )
 
+def save_vips_rgb(
+    rgb: np.ndarray,
+    out_path: str,
+    invert: bool = False,
+    footer_text: str | None = None,
+    *,
+    footer_pad_lr_px: int = 48,
+    footer_dpi: int = 300,
+) -> None:
+    base = np_to_vips_rgb_u8(rgb)
+    if invert: base = base ^ 255
+    if footer_text:
+        base = add_footer_label(
+            base,
+            footer_text,
+            pad_lr_px=footer_pad_lr_px,
+            dpi=footer_dpi,
+            align="centre",
+            invert=False,  # keep semantics same as save_jpg_rgb
+        )
+    root, ext = os.path.splitext(out_path)
+    if ext.lower() not in {".v", ".vips"}:
+        out_path = root + ".v"
+    base.write_to_file(out_path)
+
 def save_png_rgb(
     rgb: np.ndarray,
     out_path: str,
@@ -446,25 +471,10 @@ def save_png_rgb(
     footer_pad_lr_px: int = 48,
     footer_dpi: int = 300,
 ) -> None:
-    """
-    Save an 8-bit RGB PNG from a numpy array.
-
-    rgb:
-        H x W x 3 or 3 x H x W, dtype uint8 (or anything coercible to uint8).
-
-    invert:
-        If True, replace each channel with 255 - value (simple negative).
-
-    footer_text:
-        Optional text label rendered at the bottom using add_footer_label().
-    """
     base = np_to_vips_rgb_u8(rgb)
 
-    if invert:
-        base = 255 - base
-
+    if invert: base = base ^ 255
     if footer_text:
-        # add_footer_label works on 1-band; for RGB, it will broadcast the mask
         base = add_footer_label(
             base,
             footer_text,
@@ -473,15 +483,12 @@ def save_png_rgb(
             align="centre",
             invert=False,  # if you want "invert" effect, apply via invert=True above
         )
-
-    # PNG, 8-bit RGB
     base.write_to_file(
         out_path,
         compression=1,
         effort=1,
         interlace=False,
         strip=True,
-        # bitdepth default is 8 for uchar; don't override it here
     )
 
 def save_png_bilevel(
@@ -494,17 +501,11 @@ def save_png_bilevel(
     footer_dpi: int = 300,
     passepartout = False
 ):
-    """
-    Save a bilevel (0/255) PNG from a numpy array, optionally adding a footer title.
-    """
     if canvas.dtype != np.uint8:
         canvas = canvas.astype(np.uint8, copy=False)
-    if invert:
-        canvas = 255 - canvas
-
+    if invert: canvas = canvas ^ 255
     H, W = canvas.shape
     base = vips.Image.new_from_memory(canvas.data, W, H, 1, "uchar")
-
     if footer_text:
         base = add_footer_label(
             base,
@@ -514,7 +515,6 @@ def save_png_bilevel(
             align="centre",
             invert=invert,
         )
-
     if passepartout:
         base = add_rounded_passepartout_bilevel_pct(
             base,
@@ -523,8 +523,6 @@ def save_png_bilevel(
             auto_white_bg = True,
             mat_value = None,   # 255 or 0 if you want to override
         )
-
-
     base.write_to_file(
         out_path,
         compression=1,
