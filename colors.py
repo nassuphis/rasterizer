@@ -1,5 +1,6 @@
 import math
 import numpy as np
+import colorsys
 
 DEFAULT_GAMMA = 1
 
@@ -1317,7 +1318,7 @@ COLOR_STRINGS.update(COLOR_TRI_STRINGS)
 COLOR_STRINGS.update(COLOR_LONG_STRINGS)
 
 # ---------------------------------------------------------------------------
-# Color mapping: Lyapunov exponent -> RGB (schemes)
+# Histogram equalization
 # ---------------------------------------------------------------------------
 
 def _hist_equalize(values: np.ndarray, nbins: int = 256) -> np.ndarray:
@@ -1349,8 +1350,61 @@ def _hist_equalize(values: np.ndarray, nbins: int = 256) -> np.ndarray:
     t = cdf[idx]
     return t
 
+# ---------------------------------------------------------------------------
+# HSV helpers
+# ---------------------------------------------------------------------------
 
 
+def _rgb255_to_hsv01(rgb255: tuple[float, float, float]) -> tuple[float, float, float]:
+    r, g, b = rgb255
+    return colorsys.rgb_to_hsv(float(r) / 255.0, float(g) / 255.0, float(b) / 255.0)
+
+def _interp_hue_short_arc(h0: float, h1: float, t: np.ndarray) -> np.ndarray:
+    """
+    Hue interpolation on a circle, shortest path. h0,h1 in [0,1], t array in [0,1].
+    """
+    dh = h1 - h0
+    if dh > 0.5:
+        dh -= 1.0
+    elif dh < -0.5:
+        dh += 1.0
+    return (h0 + dh * t) % 1.0
+
+def _hsv01_to_rgb255_batch(h: np.ndarray, s: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """
+    Vectorized HSV(0..1) -> RGB(0..255). Returns float64 (...,3).
+    """
+    c = v * s
+    hp = h * 6.0
+    x = c * (1.0 - np.abs((hp % 2.0) - 1.0))
+    m = v - c
+
+    r_ = np.zeros_like(h)
+    g_ = np.zeros_like(h)
+    b_ = np.zeros_like(h)
+
+    c0 = (0.0 <= hp) & (hp < 1.0)
+    c1 = (1.0 <= hp) & (hp < 2.0)
+    c2 = (2.0 <= hp) & (hp < 3.0)
+    c3 = (3.0 <= hp) & (hp < 4.0)
+    c4 = (4.0 <= hp) & (hp < 5.0)
+    c5 = (5.0 <= hp) & (hp < 6.0)
+
+    r_[c0], g_[c0], b_[c0] = c[c0], x[c0], 0.0
+    r_[c1], g_[c1], b_[c1] = x[c1], c[c1], 0.0
+    r_[c2], g_[c2], b_[c2] = 0.0, c[c2], x[c2]
+    r_[c3], g_[c3], b_[c3] = 0.0, x[c3], c[c3]
+    r_[c4], g_[c4], b_[c4] = x[c4], 0.0, c[c4]
+    r_[c5], g_[c5], b_[c5] = c[c5], 0.0, x[c5]
+
+    r = (r_ + m) * 255.0
+    g = (g_ + m) * 255.0
+    b = (b_ + m) * 255.0
+    return np.stack([r, g, b], axis=-1)
+
+# ---------------------------------------------------------------------------
+# RGB Colorizers
+# ---------------------------------------------------------------------------
 
 def rgb_scheme_mh(lyap: np.ndarray, params: dict) -> np.ndarray:
     """
@@ -1454,6 +1508,77 @@ def rgb_scheme_mh_eq(lyap: np.ndarray, params: dict) -> np.ndarray:
 
     return rgb
 
+# ---------------------------------------------------------------------------
+# HSV Colorizers
+# ---------------------------------------------------------------------------
+
+def hsv_scheme_mh_eq(lyap: np.ndarray, params: dict) -> np.ndarray:
+    """
+    Like rgb_scheme_mh_eq, but interpolate colors in HSV (with hue shortest-arc),
+    while keeping the same histogram equalization and gamma.
+    """
+    arr = np.asarray(lyap, dtype=np.float64)
+    H, W = arr.shape
+    rgb = np.zeros((H, W, 3), dtype=np.uint8)
+
+    finite = np.isfinite(arr)
+    if not np.any(finite):
+        return rgb
+
+    neg_mask = finite & (arr < 0.0)
+    pos_mask = finite & (arr > 0.0)
+
+    gamma = params.get("gamma", DEFAULT_GAMMA)
+    gamma = 1 if gamma <= 0.0 else gamma
+    nbins = int(params.get("nbins", 256))
+
+    pos_spec = params.get("pos_color", "FF0000")
+    zero_spec = params.get("zero_color", "000000")
+    neg_spec = params.get("neg_color", "FFFF00")
+
+    pos_rgb = parse_color_spec(pos_spec, (255.0, 0.0, 0.0))
+    zero_rgb = parse_color_spec(zero_spec, (0.0, 0.0, 0.0))
+    neg_rgb = parse_color_spec(neg_spec, (255.0, 255.0, 0.0))
+
+    # Convert palette endpoints to HSV
+    pos_h, pos_s, pos_v = _rgb255_to_hsv01(pos_rgb)
+    zero_h, zero_s, zero_v = _rgb255_to_hsv01(zero_rgb)
+    neg_h, neg_s, neg_v = _rgb255_to_hsv01(neg_rgb)
+
+    # λ < 0: equalize |λ|
+    if np.any(neg_mask):
+        vals = np.abs(arr[neg_mask])
+        t = _hist_equalize(vals, nbins=nbins)
+        if gamma != 1.0:
+            t = t ** float(gamma)
+
+        h = _interp_hue_short_arc(zero_h, neg_h, t)
+        s = zero_s + t * (neg_s - zero_s)
+        v = zero_v + t * (neg_v - zero_v)
+
+        rgb_neg = _hsv01_to_rgb255_batch(h, s, v)
+        rgb[neg_mask, 0] = np.clip(np.rint(rgb_neg[:, 0]), 0, 255).astype(np.uint8)
+        rgb[neg_mask, 1] = np.clip(np.rint(rgb_neg[:, 1]), 0, 255).astype(np.uint8)
+        rgb[neg_mask, 2] = np.clip(np.rint(rgb_neg[:, 2]), 0, 255).astype(np.uint8)
+
+    # λ > 0: equalize λ
+    if np.any(pos_mask):
+        vals = arr[pos_mask]
+        t = _hist_equalize(vals, nbins=nbins)
+        if gamma != 1.0:
+            t = t ** float(gamma)
+
+        h = _interp_hue_short_arc(zero_h, pos_h, t)
+        s = zero_s + t * (pos_s - zero_s)
+        v = zero_v + t * (pos_v - zero_v)
+
+        rgb_pos = _hsv01_to_rgb255_batch(h, s, v)
+        rgb[pos_mask, 0] = np.clip(np.rint(rgb_pos[:, 0]), 0, 255).astype(np.uint8)
+        rgb[pos_mask, 1] = np.clip(np.rint(rgb_pos[:, 1]), 0, 255).astype(np.uint8)
+        rgb[pos_mask, 2] = np.clip(np.rint(rgb_pos[:, 2]), 0, 255).astype(np.uint8)
+
+    return rgb
+
 
 def rgb_scheme_palette_eq(lyap: np.ndarray, params: dict) -> np.ndarray:
     """
@@ -1489,6 +1614,37 @@ def rgb_scheme_palette_eq(lyap: np.ndarray, params: dict) -> np.ndarray:
 
     return rgb_scheme_mh_eq(lyap, sub_params)
 
+def hsv_scheme_palette_eq(lyap: np.ndarray, params: dict) -> np.ndarray:
+    """
+    Equivalent to rgb_scheme_palette_eq, but routes to hsv_scheme_mh_eq
+    so interpolation is done in HSV.
+    """
+    palette_name = params.get("palette")
+    if palette_name is None:
+        raise ValueError("params['palette'] must be set to a key in COLOR_TRI_STRINGS")
+
+    if palette_name not in COLOR_TRI_STRINGS:
+        raise KeyError(
+            f"Unknown palette {palette_name!r}. "
+            f"Available: {', '.join(sorted(COLOR_TRI_STRINGS.keys()))}"
+        )
+
+    palette_spec = COLOR_TRI_STRINGS[palette_name]
+    try:
+        parts = palette_spec.split(":")
+        neg_spec, zero_spec, pos_spec = parts[:3]
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid COLOR_TRI_STRINGS entry for {palette_name!r}: {palette_spec!r} "
+            "(expected 'NEG:ZERO:POS')"
+        ) from exc
+
+    sub_params = dict(params)
+    sub_params["neg_color"] = neg_spec
+    sub_params["zero_color"] = zero_spec
+    sub_params["pos_color"] = pos_spec
+
+    return hsv_scheme_mh_eq(lyap, sub_params)
 
 def rgb_scheme_multipoint(lyap: np.ndarray, params: dict) -> np.ndarray:
     """
