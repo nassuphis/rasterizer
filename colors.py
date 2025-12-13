@@ -1,6 +1,7 @@
 import math
 import numpy as np
 import colorsys
+from scipy.ndimage import gaussian_filter, sobel, laplace, gaussian_laplace
 
 DEFAULT_GAMMA = 1
 
@@ -1350,6 +1351,7 @@ def _hist_equalize(values: np.ndarray, nbins: int = 256) -> np.ndarray:
     t = cdf[idx]
     return t
 
+
 # ---------------------------------------------------------------------------
 # HSV helpers
 # ---------------------------------------------------------------------------
@@ -1403,182 +1405,142 @@ def _hsv01_to_rgb255_batch(h: np.ndarray, s: np.ndarray, v: np.ndarray) -> np.nd
     return np.stack([r, g, b], axis=-1)
 
 # ---------------------------------------------------------------------------
+# Field normalization
+# ---------------------------------------------------------------------------
+
+def _two_sided_t_and_masks(v: np.ndarray, params: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns:
+        t     : float64 (H,W) in [0,1]
+        finite: bool (H,W)
+        neg   : bool (H,W) finite & v<0
+        pos   : bool (H,W) finite & v>0
+
+    params:
+        norm  : "linear" | "eq"  (default "linear")
+        gamma : float (default DEFAULT_GAMMA)
+        nbins : int (for eq, default 256)
+    """
+    v = np.asarray(v, dtype=np.float64)
+    finite = np.isfinite(v)
+    neg = finite & (v < 0.0)
+    pos = finite & (v > 0.0)
+
+    t = np.zeros_like(v, dtype=np.float64)
+    norm = params.get("norm", "linear")
+    nbins = int(params.get("nbins", 256))
+
+    if norm == "eq":
+        if np.any(neg):
+            t[neg] = _hist_equalize(np.abs(v[neg]), nbins=nbins)
+        if np.any(pos):
+            t[pos] = _hist_equalize(v[pos], nbins=nbins)
+    elif norm == "linear":
+        min_neg = float(v[neg].min()) if np.any(neg) else 0.0
+        max_pos = float(v[pos].max()) if np.any(pos) else 0.0
+        scale = max(abs(min_neg), abs(max_pos))
+        scale = 1.0 if (not math.isfinite(scale)) or scale <= 0.0 else scale
+        if np.any(neg):
+            t[neg] = np.abs(v[neg]) / scale
+        if np.any(pos):
+            t[pos] = v[pos] / scale
+    else:
+        raise ValueError(f"Unknown norm {norm!r}. Use 'linear' or 'eq'.")
+
+    t = np.clip(t, 0.0, 1.0)
+
+    gamma = params.get("gamma", DEFAULT_GAMMA)
+    gamma = 1.0 if float(gamma) <= 0.0 else float(gamma)
+    if gamma != 1.0:
+        t = t ** gamma
+
+    return t, finite, neg, pos
+
+def _parse_tri_colors(params: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Resolve neg / zero / pos colors from params into RGB255 float arrays.
+
+    params:
+        neg_color  : str (default "FFFF00")
+        zero_color : str (default "000000")
+        pos_color  : str (default "FF0000")
+
+    Returns:
+        neg_rgb  : (3,) float64
+        zero_rgb : (3,) float64
+        pos_rgb  : (3,) float64
+    """
+    pos_spec  = params.get("pos_color",  "FF0000")
+    zero_spec = params.get("zero_color", "000000")
+    neg_spec  = params.get("neg_color",  "FFFF00")
+
+    neg_rgb  = np.asarray(parse_color_spec(neg_spec,  (255.0, 255.0, 0.0)), dtype=np.float64)
+    zero_rgb = np.asarray(parse_color_spec(zero_spec, (0.0,   0.0,   0.0)), dtype=np.float64)
+    pos_rgb  = np.asarray(parse_color_spec(pos_spec,  (255.0, 0.0,   0.0)), dtype=np.float64)
+
+    return neg_rgb, zero_rgb, pos_rgb
+
+# ---------------------------------------------------------------------------
 # RGB Colorizers
 # ---------------------------------------------------------------------------
 
 def rgb_scheme_mh(lyap: np.ndarray, params: dict) -> np.ndarray:
     """
-    Markus & Hess style:
-
-      λ < 0 : black  -> yellow  (periodic / order)
-      λ = 0 : black
-      λ > 0 : black  -> red or blue (chaos)
-
-    'clip' controls the symmetric |λ| range. If clip is None, auto-range.
+    Markus & Hess style (RGB interpolation, linear normalization).
     """
-    arr = np.asarray(lyap, dtype=np.float64)
-    H, W = arr.shape
+    v = np.asarray(lyap, dtype=np.float64)
+    if v.ndim != 2:
+        raise ValueError("lyap array must be 2D (H, W)")
+
+    H, W = v.shape
     rgb = np.zeros((H, W, 3), dtype=np.uint8)
 
-    finite = np.isfinite(arr)
-    if not np.any(finite):
-        return rgb
+    t, finite, neg, pos = _two_sided_t_and_masks(v, dict(params, norm="linear"))
+    if not np.any(finite): return rgb
 
-    neg_mask = finite & (arr < 0.0)
-    pos_mask = finite & (arr > 0.0)
+    neg_rgb, zero_rgb, pos_rgb = _parse_tri_colors(params)
 
-    gamma = params.get("gamma", DEFAULT_GAMMA)
-    gamma = 1 if gamma <= 0.0 else gamma
+    if np.any(neg):
+        tn = t[neg][:, None]
+        rgb[neg] = np.rint((1.0 - tn) * zero_rgb + tn * neg_rgb).astype(np.uint8)
 
-    pos_spec = params.get("pos_color", "FF0000")   # red
-    zero_spec = params.get("zero_color", "000000")   # black
-    neg_spec = params.get("neg_color", "FFFF00")   # yellow
-    pos_r, pos_g, pos_b = parse_color_spec(pos_spec, (255.0, 0.0, 0.0))
-    zero_r, zero_g, zero_b = parse_color_spec(zero_spec, (0.0, 0.0, 0.0))
-    neg_r, neg_g, neg_b = parse_color_spec(neg_spec, (255.0, 255.0, 0.0))
-
-    min_neg = float(arr[neg_mask].min()) if np.any(neg_mask) else 0.0
-    max_pos = float(arr[pos_mask].max()) if np.any(pos_mask) else 0.0
-    scale = max(abs(min_neg), abs(max_pos))
-    scale = 1 if (not math.isfinite(scale)) or scale <= 0.0 else scale
-
-    # λ < 0 → black→yellow
-    if np.any(neg_mask):
-        lam_neg = np.clip(arr[neg_mask], -scale, 0.0)
-        t = np.abs(lam_neg) / scale
-        t = t ** float(gamma) if gamma != 1.0 else t
-        rgb[neg_mask, 0] = np.rint(t * neg_r + (1-t)*zero_r).astype(np.uint8)
-        rgb[neg_mask, 1] = np.rint(t * neg_g + (1-t)*zero_g).astype(np.uint8)
-        rgb[neg_mask, 2] = np.rint(t * neg_b + (1-t)*zero_b).astype(np.uint8)
-
-    # λ > 0 → black→red/blue
-    if np.any(pos_mask):
-        lam_pos = np.clip(arr[pos_mask], 0.0, scale)
-        t = lam_pos / scale
-        t = t ** float(gamma) if gamma != 1.0 else t
-        rgb[pos_mask, 0] = np.rint(t * pos_r + (1-t)*zero_r).astype(np.uint8)
-        rgb[pos_mask, 1] = np.rint(t * pos_g + (1-t)*zero_g).astype(np.uint8)
-        rgb[pos_mask, 2] = np.rint(t * pos_b + (1-t)*zero_b).astype(np.uint8)
+    if np.any(pos):
+        tp = t[pos][:, None]
+        rgb[pos] = np.rint((1.0 - tp) * zero_rgb + tp * pos_rgb).astype(np.uint8)
 
     return rgb
-
 
 def rgb_scheme_mh_eq(lyap: np.ndarray, params: dict) -> np.ndarray:
 
-    arr = np.asarray(lyap, dtype=np.float64)
-    H, W = arr.shape
+    v = np.asarray(lyap, dtype=np.float64)
+    if v.ndim != 2:
+        raise ValueError("lyap array must be 2D (H, W)")
+
+    H, W = v.shape
     rgb = np.zeros((H, W, 3), dtype=np.uint8)
 
-    finite = np.isfinite(arr)
-    if not np.any(finite):
-        return rgb
+    # Shared normalization + masks
+    t, finite, neg, pos = _two_sided_t_and_masks(v, dict(params, norm="eq"))
+    if not np.any(finite): return rgb
 
-    neg_mask = finite & (arr < 0.0)
-    pos_mask = finite & (arr > 0.0)
+    # Resolve endpoint colors once
+    neg_rgb, zero_rgb, pos_rgb = _parse_tri_colors(params)
 
-    gamma = params.get("gamma", DEFAULT_GAMMA)
-    gamma = 1 if gamma <= 0.0 else gamma
-    nbins = int(params.get("nbins", 256))
+    # λ < 0 : zero -> neg
+    if np.any(neg):
+        tn = t[neg][:, None]
+        rgb[neg] = np.rint((1.0 - tn) * zero_rgb + tn * neg_rgb).astype(np.uint8)
 
-    pos_spec = params.get("pos_color", "FF0000")   # red
-    zero_spec = params.get("zero_color", "000000")   # black
-    neg_spec = params.get("neg_color", "FFFF00")   # yellow
-    pos_r, pos_g, pos_b = parse_color_spec(pos_spec, (255.0, 0.0, 0.0))
-    zero_r, zero_g, zero_b = parse_color_spec(zero_spec, (0.0, 0.0, 0.0))
-    neg_r, neg_g, neg_b = parse_color_spec(neg_spec, (255.0, 255.0, 0.0))
-
-
-    # λ < 0: equalize |λ|
-    if np.any(neg_mask):
-        vals = np.abs(arr[neg_mask])
-        t = _hist_equalize(vals, nbins=nbins)  # in [0,1]
-        t = t ** float(gamma) if gamma != 1.0 else t
-        rgb[neg_mask, 0] = np.rint(t * neg_r + (1-t)*zero_r).astype(np.uint8)
-        rgb[neg_mask, 1] = np.rint(t * neg_g + (1-t)*zero_g).astype(np.uint8)
-        rgb[neg_mask, 2] = np.rint(t * neg_b + (1-t)*zero_b).astype(np.uint8)
-
-    # λ > 0: equalize λ
-    if np.any(pos_mask):
-        vals = arr[pos_mask]
-        t = _hist_equalize(vals, nbins=nbins)  # in [0,1]
-        t = t ** float(gamma) if gamma != 1.0 else t
-        rgb[pos_mask, 0] = np.rint(t * pos_r + (1-t)*zero_r).astype(np.uint8)
-        rgb[pos_mask, 1] = np.rint(t * pos_g + (1-t)*zero_g).astype(np.uint8)
-        rgb[pos_mask, 2] = np.rint(t * pos_b + (1-t)*zero_b).astype(np.uint8)
+    # λ > 0 : zero -> pos
+    if np.any(pos):
+        tp = t[pos][:, None]
+        rgb[pos] = np.rint((1.0 - tp) * zero_rgb + tp * pos_rgb).astype(np.uint8)
 
     return rgb
 
 # ---------------------------------------------------------------------------
-# HSV Colorizers
+# composite rgb colorizers
 # ---------------------------------------------------------------------------
-
-def hsv_scheme_mh_eq(lyap: np.ndarray, params: dict) -> np.ndarray:
-    """
-    Like rgb_scheme_mh_eq, but interpolate colors in HSV (with hue shortest-arc),
-    while keeping the same histogram equalization and gamma.
-    """
-    arr = np.asarray(lyap, dtype=np.float64)
-    H, W = arr.shape
-    rgb = np.zeros((H, W, 3), dtype=np.uint8)
-
-    finite = np.isfinite(arr)
-    if not np.any(finite):
-        return rgb
-
-    neg_mask = finite & (arr < 0.0)
-    pos_mask = finite & (arr > 0.0)
-
-    gamma = params.get("gamma", DEFAULT_GAMMA)
-    gamma = 1 if gamma <= 0.0 else gamma
-    nbins = int(params.get("nbins", 256))
-
-    pos_spec = params.get("pos_color", "FF0000")
-    zero_spec = params.get("zero_color", "000000")
-    neg_spec = params.get("neg_color", "FFFF00")
-
-    pos_rgb = parse_color_spec(pos_spec, (255.0, 0.0, 0.0))
-    zero_rgb = parse_color_spec(zero_spec, (0.0, 0.0, 0.0))
-    neg_rgb = parse_color_spec(neg_spec, (255.0, 255.0, 0.0))
-
-    # Convert palette endpoints to HSV
-    pos_h, pos_s, pos_v = _rgb255_to_hsv01(pos_rgb)
-    zero_h, zero_s, zero_v = _rgb255_to_hsv01(zero_rgb)
-    neg_h, neg_s, neg_v = _rgb255_to_hsv01(neg_rgb)
-
-    # λ < 0: equalize |λ|
-    if np.any(neg_mask):
-        vals = np.abs(arr[neg_mask])
-        t = _hist_equalize(vals, nbins=nbins)
-        if gamma != 1.0:
-            t = t ** float(gamma)
-
-        h = _interp_hue_short_arc(zero_h, neg_h, t)
-        s = zero_s + t * (neg_s - zero_s)
-        v = zero_v + t * (neg_v - zero_v)
-
-        rgb_neg = _hsv01_to_rgb255_batch(h, s, v)
-        rgb[neg_mask, 0] = np.clip(np.rint(rgb_neg[:, 0]), 0, 255).astype(np.uint8)
-        rgb[neg_mask, 1] = np.clip(np.rint(rgb_neg[:, 1]), 0, 255).astype(np.uint8)
-        rgb[neg_mask, 2] = np.clip(np.rint(rgb_neg[:, 2]), 0, 255).astype(np.uint8)
-
-    # λ > 0: equalize λ
-    if np.any(pos_mask):
-        vals = arr[pos_mask]
-        t = _hist_equalize(vals, nbins=nbins)
-        if gamma != 1.0:
-            t = t ** float(gamma)
-
-        h = _interp_hue_short_arc(zero_h, pos_h, t)
-        s = zero_s + t * (pos_s - zero_s)
-        v = zero_v + t * (pos_v - zero_v)
-
-        rgb_pos = _hsv01_to_rgb255_batch(h, s, v)
-        rgb[pos_mask, 0] = np.clip(np.rint(rgb_pos[:, 0]), 0, 255).astype(np.uint8)
-        rgb[pos_mask, 1] = np.clip(np.rint(rgb_pos[:, 1]), 0, 255).astype(np.uint8)
-        rgb[pos_mask, 2] = np.clip(np.rint(rgb_pos[:, 2]), 0, 255).astype(np.uint8)
-
-    return rgb
-
 
 def rgb_scheme_palette_eq(lyap: np.ndarray, params: dict) -> np.ndarray:
     """
@@ -1614,37 +1576,6 @@ def rgb_scheme_palette_eq(lyap: np.ndarray, params: dict) -> np.ndarray:
 
     return rgb_scheme_mh_eq(lyap, sub_params)
 
-def hsv_scheme_palette_eq(lyap: np.ndarray, params: dict) -> np.ndarray:
-    """
-    Equivalent to rgb_scheme_palette_eq, but routes to hsv_scheme_mh_eq
-    so interpolation is done in HSV.
-    """
-    palette_name = params.get("palette")
-    if palette_name is None:
-        raise ValueError("params['palette'] must be set to a key in COLOR_TRI_STRINGS")
-
-    if palette_name not in COLOR_TRI_STRINGS:
-        raise KeyError(
-            f"Unknown palette {palette_name!r}. "
-            f"Available: {', '.join(sorted(COLOR_TRI_STRINGS.keys()))}"
-        )
-
-    palette_spec = COLOR_TRI_STRINGS[palette_name]
-    try:
-        parts = palette_spec.split(":")
-        neg_spec, zero_spec, pos_spec = parts[:3]
-    except ValueError as exc:
-        raise ValueError(
-            f"Invalid COLOR_TRI_STRINGS entry for {palette_name!r}: {palette_spec!r} "
-            "(expected 'NEG:ZERO:POS')"
-        ) from exc
-
-    sub_params = dict(params)
-    sub_params["neg_color"] = neg_spec
-    sub_params["zero_color"] = zero_spec
-    sub_params["pos_color"] = pos_spec
-
-    return hsv_scheme_mh_eq(lyap, sub_params)
 
 def rgb_scheme_multipoint(lyap: np.ndarray, params: dict) -> np.ndarray:
     """
@@ -1732,4 +1663,501 @@ def rgb_scheme_multipoint(lyap: np.ndarray, params: dict) -> np.ndarray:
     rgb[finite] = rgb_vals
 
     return rgb
+
+# ---------------------------------------------------------------------------
+# HSV Colorizers
+# ---------------------------------------------------------------------------
+
+def hsv_scheme_mh_eq(lyap: np.ndarray, params: dict) -> np.ndarray:
+    """
+    Markus & Hess style with histogram equalization, interpolating in HSV
+    (shortest-arc hue), using shared two-sided normalization.
+
+      λ < 0 : zero_color -> neg_color
+      λ = 0 : zero_color
+      λ > 0 : zero_color -> pos_color
+
+    Normalization:
+      - Uses _two_sided_t_and_masks(..., norm="eq")
+      - t ∈ [0,1] is hist-eq(|λ|) on neg side and hist-eq(λ) on pos side
+      - gamma applied inside the helper
+
+    params:
+        norm       : must be "eq" (forced internally)
+        gamma      : float (optional, default DEFAULT_GAMMA)
+        nbins      : int   (optional, default 256)
+
+        pos_color  : str   (optional, default "FF0000")
+        zero_color : str   (optional, default "000000")
+        neg_color  : str   (optional, default "FFFF00")
+    """
+    v = np.asarray(lyap, dtype=np.float64)
+    if v.ndim != 2:
+        raise ValueError("lyap array must be 2D (H, W)")
+
+    H, W = v.shape
+    out = np.zeros((H, W, 3), dtype=np.uint8)
+
+    # Shared normalization + masks
+    t, finite, neg, pos = _two_sided_t_and_masks(v, dict(params, norm="eq"))
+    if not np.any(finite):
+        return out
+
+    # Resolve endpoint colors once
+    neg_rgb, zero_rgb, pos_rgb = _parse_tri_colors(params)
+
+    # Convert endpoints to HSV once
+    neg_h, neg_s, neg_v = _rgb255_to_hsv01(tuple(neg_rgb))
+    zero_h, zero_s, zero_v = _rgb255_to_hsv01(tuple(zero_rgb))
+    pos_h, pos_s, pos_v = _rgb255_to_hsv01(tuple(pos_rgb))
+
+    # λ < 0 : zero -> neg
+    if np.any(neg):
+        tn = t[neg]
+        h = _interp_hue_short_arc(zero_h, neg_h, tn)
+        s = zero_s + tn * (neg_s - zero_s)
+        v_ = zero_v + tn * (neg_v - zero_v)
+
+        rgb = _hsv01_to_rgb255_batch(h, s, v_)
+        out[neg] = np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
+
+    # λ > 0 : zero -> pos
+    if np.any(pos):
+        tp = t[pos]
+        h = _interp_hue_short_arc(zero_h, pos_h, tp)
+        s = zero_s + tp * (pos_s - zero_s)
+        v_ = zero_v + tp * (pos_v - zero_v)
+
+        rgb = _hsv01_to_rgb255_batch(h, s, v_)
+        out[pos] = np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
+
+    return out
+
+def hsv_scheme_palette_eq(lyap: np.ndarray, params: dict) -> np.ndarray:
+    """
+    Equivalent to rgb_scheme_palette_eq, but routes to hsv_scheme_mh_eq
+    so interpolation is done in HSV.
+    """
+    palette_name = params.get("palette")
+    if palette_name is None:
+        raise ValueError("params['palette'] must be set to a key in COLOR_TRI_STRINGS")
+
+    if palette_name not in COLOR_TRI_STRINGS:
+        raise KeyError(
+            f"Unknown palette {palette_name!r}. "
+            f"Available: {', '.join(sorted(COLOR_TRI_STRINGS.keys()))}"
+        )
+
+    palette_spec = COLOR_TRI_STRINGS[palette_name]
+    try:
+        parts = palette_spec.split(":")
+        neg_spec, zero_spec, pos_spec = parts[:3]
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid COLOR_TRI_STRINGS entry for {palette_name!r}: {palette_spec!r} "
+            "(expected 'NEG:ZERO:POS')"
+        ) from exc
+
+    sub_params = dict(params)
+    sub_params["neg_color"] = neg_spec
+    sub_params["zero_color"] = zero_spec
+    sub_params["pos_color"] = pos_spec
+
+    return hsv_scheme_mh_eq(lyap, sub_params)
+
+
+# ---------------------------------------------------------------------------
+# Palette field colorizers (per-pixel palette via palette arithmetic)
+# ---------------------------------------------------------------------------
+
+def _norm01_percentile(x: np.ndarray, lo: float = 10.0, hi: float = 99.0) -> np.ndarray:
+    """
+    Robust normalize to [0,1] via percentiles (computed on finite entries).
+    """
+    x = np.asarray(x, dtype=np.float64)
+    finite = np.isfinite(x)
+    if not np.any(finite):
+        return np.zeros_like(x, dtype=np.float64)
+
+    a = x[finite]
+    q0, q1 = np.percentile(a, [float(lo), float(hi)])
+    if (not math.isfinite(q0)) or (not math.isfinite(q1)) or (q1 <= q0):
+        return np.zeros_like(x, dtype=np.float64)
+
+    y = (x - q0) / (q1 - q0)
+    return np.clip(y, 0.0, 1.0)
+
+def _tri_palette_from_name(palette_name: str) -> np.ndarray:
+    """
+    Return tri-palette as float64 array shape (3,3) in RGB255:
+        idx 0 = neg, 1 = zero, 2 = pos
+    """
+    if palette_name not in COLOR_TRI_STRINGS:
+        raise KeyError(
+            f"Unknown palette {palette_name!r}. "
+            f"Available: {', '.join(sorted(COLOR_TRI_STRINGS.keys()))}"
+        )
+    palette_spec = COLOR_TRI_STRINGS[palette_name]
+    parts = palette_spec.split(":")
+    if len(parts) < 3:
+        raise ValueError(
+            f"Invalid COLOR_TRI_STRINGS entry for {palette_name!r}: {palette_spec!r} "
+            "(expected 'NEG:ZERO:POS')"
+        )
+    neg_spec, zero_spec, pos_spec = parts[:3]
+    neg_rgb = parse_color_spec(neg_spec, (0.0, 0.0, 0.0))
+    zer_rgb = parse_color_spec(zero_spec, (0.0, 0.0, 0.0))
+    pos_rgb = parse_color_spec(pos_spec, (0.0, 0.0, 0.0))
+    P = np.asarray([neg_rgb, zer_rgb, pos_rgb], dtype=np.float64)
+    return P  # (3,3)
+
+def _blend_tri_palettes_rgb(P0: np.ndarray, P1: np.ndarray, w: np.ndarray) -> np.ndarray:
+    """
+    Blend two tri-palettes into a per-pixel tri-palette field.
+
+    P0,P1: (3,3) float64 in RGB255
+    w: (H,W) in [0,1]
+    returns: (H,W,3,3)
+    """
+    w = np.asarray(w, dtype=np.float64)
+    return (1.0 - w[..., None, None]) * P0[None, None, :, :] + w[..., None, None] * P1[None, None, :, :]
+
+def _tri_colorize_rgb_perpixel(v: np.ndarray, P: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """
+    Tri-palette interpolation with per-pixel palette P.
+
+    v: (H,W) in [-1,1]
+    P: (H,W,3,3) RGB255, stops [neg, zero, pos]
+    t: (H,W) in [0,1] interpolation coordinate (usually abs(v) or equalized abs(v))
+
+    returns uint8 (H,W,3)
+    """
+    v = np.asarray(v, dtype=np.float64)
+    t = np.asarray(t, dtype=np.float64)
+    H, W = v.shape
+    out = np.zeros((H, W, 3), dtype=np.float64)
+
+    finite = np.isfinite(v)
+    if not np.any(finite):
+        return out.astype(np.uint8)
+
+    neg = finite & (v < 0.0)
+    pos = finite & (v > 0.0)
+
+    # stops
+    Cn = P[:, :, 0, :]  # (H,W,3)
+    Cz = P[:, :, 1, :]
+    Cp = P[:, :, 2, :]
+
+    if np.any(neg):
+        tn = t[neg][:, None]
+        out[neg] = (1.0 - tn) * Cz[neg] + tn * Cn[neg]
+
+    if np.any(pos):
+        tp = t[pos][:, None]
+        out[pos] = (1.0 - tp) * Cz[pos] + tp * Cp[pos]
+
+    return np.clip(np.rint(out), 0, 255).astype(np.uint8)
+
+def _tri_colorize_hsv_perpixel(v: np.ndarray, P_rgb: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """
+    Same as _tri_colorize_rgb_perpixel, but interpolates in HSV with shortest-arc hue.
+    Palette stops are given in RGB255; converted to HSV once per call.
+    """
+    v = np.asarray(v, dtype=np.float64)
+    t = np.asarray(t, dtype=np.float64)
+    H, W = v.shape
+    out = np.zeros((H, W, 3), dtype=np.uint8)
+
+    finite = np.isfinite(v)
+    if not np.any(finite):
+        return out
+
+    # Convert palette stops to HSV arrays (H,W,3stops)
+    # P_rgb: (H,W,3,3) -> per stop convert rgb->hsv
+    # We'll do it stop-by-stop with vectorization; rgb_to_hsv isn't vectorized, so reuse your custom batch HSV->RGB,
+    # but RGB->HSV is not batched. We'll approximate by doing it per stop via numpy formulas.
+    # Minimal deviation: do RGB blending + RGB->HSV conversion with explicit formulas here.
+
+    Pr = np.clip(P_rgb[..., 0], 0, 255) / 255.0
+    Pg = np.clip(P_rgb[..., 1], 0, 255) / 255.0
+    Pb = np.clip(P_rgb[..., 2], 0, 255) / 255.0
+
+    cmax = np.maximum(np.maximum(Pr, Pg), Pb)
+    cmin = np.minimum(np.minimum(Pr, Pg), Pb)
+    delta = cmax - cmin
+
+    # Hue
+    Hh = np.zeros_like(cmax)
+    mask = delta > 1e-12
+    # where max is R
+    mr = mask & (cmax == Pr)
+    mg = mask & (cmax == Pg)
+    mb = mask & (cmax == Pb)
+
+    Hh[mr] = ((Pg[mr] - Pb[mr]) / delta[mr]) % 6.0
+    Hh[mg] = ((Pb[mg] - Pr[mg]) / delta[mg]) + 2.0
+    Hh[mb] = ((Pr[mb] - Pg[mb]) / delta[mb]) + 4.0
+    Hh = (Hh / 6.0) % 1.0
+
+    # Sat
+    Ss = np.zeros_like(cmax)
+    nonzero = cmax > 1e-12
+    Ss[nonzero] = delta[nonzero] / cmax[nonzero]
+
+    # Val
+    Vv = cmax
+
+    # Now interpolate in HSV between stops per pixel, separately for neg/pos
+    neg = finite & (v < 0.0)
+    pos = finite & (v > 0.0)
+
+    # stops in HSV
+    # idx 0=neg, 1=zero, 2=pos
+    Hn, Hz, Hp = Hh[:, :, 0], Hh[:, :, 1], Hh[:, :, 2]
+    Sn, Sz, Sp = Ss[:, :, 0], Ss[:, :, 1], Ss[:, :, 2]
+    Vn, Vz, Vp = Vv[:, :, 0], Vv[:, :, 1], Vv[:, :, 2]
+
+    if np.any(neg):
+        tn = t[neg]
+        h = _interp_hue_short_arc(Hz[neg], Hn[neg], tn)
+        s = Sz[neg] + tn * (Sn[neg] - Sz[neg])
+        vv = Vz[neg] + tn * (Vn[neg] - Vz[neg])
+        rgb = _hsv01_to_rgb255_batch(h, s, vv)
+        out[neg] = np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
+
+    if np.any(pos):
+        tp = t[pos]
+        h = _interp_hue_short_arc(Hz[pos], Hp[pos], tp)
+        s = Sz[pos] + tp * (Sp[pos] - Sz[pos])
+        vv = Vz[pos] + tp * (Vp[pos] - Vz[pos])
+        rgb = _hsv01_to_rgb255_batch(h, s, vv)
+        out[pos] = np.clip(np.rint(rgb), 0, 255).astype(np.uint8)
+
+    return out
+
+# Field Features
+
+def _laplacian_5pt(v: np.ndarray) -> np.ndarray:
+    v = np.asarray(v, dtype=np.float64)
+    p = np.pad(v, 1, mode="edge")
+    return (
+        p[1:-1, 2:] + p[1:-1, :-2] + p[2:, 1:-1] + p[:-2, 1:-1]
+        - 4.0 * p[1:-1, 1:-1]
+    )
+
+def _grad_components_scipy(v: np.ndarray, sigma: float = 0.0) -> tuple[np.ndarray, np.ndarray]:
+    v = np.asarray(v, dtype=np.float64)
+    if sigma and sigma > 0.0:
+        v = gaussian_filter(v, sigma=float(sigma), mode="nearest")
+    # sobel returns derivative-like responses
+    gx = sobel(v, axis=1, mode="nearest")  # x = columns
+    gy = sobel(v, axis=0, mode="nearest")  # y = rows
+    return gx, gy
+
+def _gradmag_scipy(v: np.ndarray, sigma: float = 0.0) -> np.ndarray:
+    gx, gy = _grad_components_scipy(v, sigma=sigma)
+    return np.sqrt(gx*gx + gy*gy)
+
+def _feature_grad_dir(v, params:dict) -> np.array:
+    theta = float(params.get("theta", 0.0))
+    sigma = float(params.get("sigma", 2.0))
+    gx, gy = _grad_components_scipy(v, sigma=sigma)
+    proj = np.cos(theta) * gx + np.sin(theta) * gy
+    proj_abs = np.abs(proj)
+    gmag = np.sqrt(gx * gx + gy * gy) + 1e-12
+    mode = str(params.get("mode", "align")).lower()
+    if mode == "align": f = proj_abs / gmag
+    elif mode == "strength": f = proj_abs
+    else: raise ValueError(f"Unknown mode {mode!r}. Use 'align', 'strength'.")
+    return f
+
+def _feature_struct_tensor_coherence(v: np.ndarray, params: dict) -> np.ndarray:
+    # Gaussian pre-blur before gradients
+    sigma_pre = float(params.get("sigma_pre", 1.0))
+    gx, gy =  _grad_components_scipy(v, sigma=sigma_pre)
+    # Tensor smoothing scale
+    sigma_tensor = float(params.get("sigma_tensor", 3.0))
+    Jxx = gaussian_filter(gx * gx, sigma=sigma_tensor, mode="nearest")
+    Jxy = gaussian_filter(gx * gy, sigma=sigma_tensor, mode="nearest")
+    Jyy = gaussian_filter(gy * gy, sigma=sigma_tensor, mode="nearest")
+    # Eigenvalue-based coherence
+    tr = Jxx + Jyy
+    det = (Jxx - Jyy)**2 + 4.0 * (Jxy**2)
+    s = np.sqrt(np.maximum(det, 0.0))
+    l1 = 0.5 * (tr + s)
+    l2 = 0.5 * (tr - s)
+    eps = 1e-12
+    return (l1 - l2) / (l1 + l2 + eps)  # ∈ [0,1]
+
+def _palette_weight_from_feature(v: np.ndarray, params: dict) -> np.ndarray:
+    v = np.asarray(v, dtype=np.float64)
+
+    w_feature = str(params.get("w_feature", "grad")).lower()
+
+    # ---- compute raw feature f ----
+    if w_feature == "grad":
+        sigma = float(params.get("sigma", 0.0))
+        f = _gradmag_scipy(v, sigma=sigma)
+
+    elif w_feature == "gradx":
+        sigma = float(params.get("sigma", 0.0))
+        gx, gy = _grad_components_scipy(v,sigma=sigma)
+        f = np.abs(gx)
+
+    elif w_feature == "grady":
+        sigma = float(params.get("sigma", 0.0))
+        gx, gy = _grad_components_scipy(v,sigma=sigma)
+        f = np.abs(gy)
+
+    elif w_feature == "grad_dir":  # oriented energy along angle (radians)
+        f = _feature_grad_dir(v, params)
+ 
+    elif w_feature == "lap":
+        sigma = float(params.get("sigma", 2.0))
+        f = np.abs(gaussian_laplace(v, sigma=sigma, mode="nearest"))
+        
+    elif w_feature == "lvar":
+        # local variance via box blurs; radius controlled by iterations
+        sigma = float(params.get("sigma", 0.0))
+        m = gaussian_filter(v, sigma=sigma, mode="nearest")
+        m2 = gaussian_filter(v*v, sigma=sigma, mode="nearest")
+        f = np.maximum(m2 - m * m, 0.0)
+
+    elif w_feature == "dog":
+        # difference of box blurs (poor man's DoG)
+        sigma1 = float(params.get("sigma1", 1.0))
+        sigma2 = float(params.get("sigma2", 4.0))
+        if sigma2 <= sigma1: sigma2 = sigma1 + 1e-6
+        g1 = gaussian_filter(v, sigma1, mode="nearest")
+        g2 = gaussian_filter(v, sigma2, mode="nearest")
+        b = g1 - g2
+        mode = str(params.get("mode", "abs")).lower()
+        if mode == "energy":
+            energy_sigma = float(params.get("energy_sigma",1.0))
+            f = gaussian_filter(b * b, sigma=energy_sigma, mode="nearest")
+        else:
+            f = np.abs(b)
+
+    elif w_feature == "sign_coh":
+        s = np.sign(v)
+        sigma = float(params.get("sigma", 0.0))
+        sbar = gaussian_filter(s, sigma=sigma, mode="nearest")
+        f = np.abs(sbar)
+
+    elif w_feature =="st_coh":
+        f = _feature_struct_tensor_coherence(v,params)
+
+    else:
+        raise ValueError(
+            f"Unknown w_feature {w_feature!r}. Try: "
+            "'grad','gradx','grady','grad_dir','lap','lvar','dog','sign_coh'."
+        )
+
+    # ---- normalize f -> w in [0,1] ----
+    w_lo = float(params.get("w_lo", 10.0))
+    w_hi = float(params.get("w_hi", 99.0))
+    w = _norm01_percentile(f, lo=w_lo, hi=w_hi)
+
+    # smooth weight (separate from feature blurs)
+    w_sigma = float(params.get("w_sigma", 0.0))
+    if w_sigma > 0.0:
+        w = gaussian_filter(w, sigma=w_sigma, mode="nearest")
+
+    # gamma shaping on weight
+    w_gamma = float(params.get("w_gamma", 1.0))
+    if w_gamma > 0.0 and w_gamma != 1.0:
+        w = np.clip(w, 0.0, 1.0) ** w_gamma
+
+    # strength LAST -> guarantees w_strength=0 => paletteA everywhere
+    strength = float(params.get("w_strength", 1.0))
+    w = np.clip(w * strength, 0.0, 1.0)
+
+    return w
+
+def rgb_scheme_palette_field(lyap: np.ndarray, params: dict) -> np.ndarray:
+    """
+    Per-pixel tri-palette blending between two named tri-palettes.
+
+    Key property (by design):
+        - If w_strength == 0, Pf == paletteA everywhere, and the result matches
+          the single-palette scheme (rgb_scheme_palette_eq) under the same
+          normalization settings (norm/gamma/nbins).
+
+    Required params:
+        paletteA : str  (name in COLOR_TRI_STRINGS)
+        paletteB : str  (name in COLOR_TRI_STRINGS)
+
+    Uses shared normalization:
+        t, finite, neg, pos = _two_sided_t_and_masks(v, params)
+        where params["norm"] is typically "eq" or "linear".
+    """
+    v = np.asarray(lyap, dtype=np.float64)
+    if v.ndim != 2:
+        raise ValueError("lyap array must be 2D (H, W)")
+
+    # palettes
+    palA = params.get("paletteA")
+    palB = params.get("paletteB")
+    if not palA or not palB:
+        raise ValueError("rgb_scheme_palette_field requires params['paletteA'] and params['paletteB']")
+
+    P0 = _tri_palette_from_name(str(palA))
+    P1 = _tri_palette_from_name(str(palB))
+
+    # weight field (already applies w_strength internally)
+    w = _palette_weight_from_feature(v, params)
+
+    # per-pixel palette (H,W,3,3)
+    Pf = _blend_tri_palettes_rgb(P0, P1, w)
+
+    # interpolation coordinate t in [0,1] with shared semantics (norm + gamma)
+    t, finite, neg, pos = _two_sided_t_and_masks(v, params)
+
+    if not np.any(finite):
+        return np.zeros((v.shape[0], v.shape[1], 3), dtype=np.uint8)
+
+    return _tri_colorize_rgb_perpixel(v, Pf, t)
+
+
+
+
+def hsv_scheme_palette_field(lyap: np.ndarray, params: dict) -> np.ndarray:
+    """
+    Per-pixel tri-palette blending between two named tri-palettes,
+    but interpolate colors in HSV (shortest-arc hue).
+
+    Key property:
+        w_strength == 0  => Pf == paletteA everywhere, and this reduces to the
+        single-palette HSV scheme under the same normalization (norm/gamma/nbins).
+
+    Uses shared normalization:
+        t, finite, neg, pos = _two_sided_t_and_masks(v, params)
+    """
+    v = np.asarray(lyap, dtype=np.float64)
+    if v.ndim != 2:
+        raise ValueError("lyap array must be 2D (H, W)")
+
+    # palettes
+    palA = params.get("paletteA")
+    palB = params.get("paletteB")
+    if not palA or not palB:
+        raise ValueError("hsv_scheme_palette_field requires params['paletteA'] and params['paletteB']")
+
+    P0 = _tri_palette_from_name(str(palA))
+    P1 = _tri_palette_from_name(str(palB))
+
+    # weight field (applies w_strength internally)
+    w = _palette_weight_from_feature(v, params)
+
+    # per-pixel palette in RGB255
+    Pf_rgb = _blend_tri_palettes_rgb(P0, P1, w)
+
+    # shared normalization (handles norm + gamma + nbins)
+    t, finite, neg, pos = _two_sided_t_and_masks(v, params)
+    if not np.any(finite):
+        return np.zeros((v.shape[0], v.shape[1], 3), dtype=np.uint8)
+
+    return _tri_colorize_hsv_perpixel(v, Pf_rgb, t)
+
 
