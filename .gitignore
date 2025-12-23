@@ -13,6 +13,7 @@ __pycache__/
 *.toc
 *.out
 *.pdf
+*.jpg
 
 # Distribution / packaging
 .Python

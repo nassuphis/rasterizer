@@ -4,6 +4,7 @@ import math
 import numpy as np
 from numba import njit, prange
 import pyvips as vips
+import subprocess
 
 # ========================================
 # dot stamping
@@ -407,6 +408,35 @@ def add_suffix_number(path: str, n: int, width: int = 5) -> str:
     base, ext = os.path.splitext(path)
     return f"{base}_{n:0{width}d}{ext}"
 
+def read_spec_exiftool(path: str) -> str:
+    out = subprocess.check_output(
+        ["exiftool", "-s3", "-XMP-lyapunov:spec", path],
+        text=True,
+    )
+    if out.strip():
+        return out.strip()
+
+    # fallback to EXIF
+    out = subprocess.check_output(
+        ["exiftool", "-s3", "-UserComment", path],
+        text=True,
+    )
+    return out.strip()
+
+def _make_xmp_packet(spec: str) -> bytes:
+    # Pick any stable URI you like for your namespace
+    ns_uri = "https://example.com/lyapunov/1.0/"
+    # Minimal XMP packet with a custom namespace + a single property
+    xml = f"""<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>
+<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+ <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+  <rdf:Description xmlns:lyapunov='{ns_uri}'
+                   lyapunov:spec='{spec}'/>
+ </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end='w'?>"""
+    return xml.encode("utf-8")
+
 def save_jpg_rgb(
     rgb: np.ndarray,
     out_path: str,
@@ -417,9 +447,13 @@ def save_jpg_rgb(
     footer_dpi: int = 300,
     quality: int = 95,
     progressive: bool = True,
+    spec: str | None = None,              # <--- add
+    keep_metadata: bool = True,           # <--- add (or just hardcode strip=False)
 ) -> None:
     base = np_to_vips_rgb_u8(rgb)
-    if invert: base = base ^ 255
+    if invert:
+        base = base ^ 255
+
     if footer_text:
         base = add_footer_label(
             base,
@@ -427,14 +461,20 @@ def save_jpg_rgb(
             pad_lr_px=footer_pad_lr_px,
             dpi=footer_dpi,
             align="centre",
-            invert=False,  # if you want negative text, use invert=True above
+            invert=False,
         )
-    # JPEG, 8-bit RGB
+
+    # Attach metadata BEFORE write
+    if spec is not None:
+        base = base.copy()  # ensure writable metadata
+        base.set_type(vips.GValue.blob_type, "xmp-data", _make_xmp_packet(spec))
+        base.set_type(vips.GValue.gstr_type,"exif-ifd0-UserComment",spec)
+
     base.write_to_file(
         out_path,
         Q=int(quality),
-        strip=True,                 # drop metadata
-        interlace=bool(progressive) # progressive JPEG if True
+        strip=(not keep_metadata),       # <-- IMPORTANT
+        interlace=bool(progressive),
     )
 
 def save_vips_rgb(
@@ -707,7 +747,7 @@ def save_mosaic_png_bilevel(
         base.write_to_file(
             out_path,
             compression=1, effort=1, filter="none",
-            interlace=False, strip=True, bitdepth=1,
+            interlace=False, strip=False, bitdepth=1,
         )
 
 
