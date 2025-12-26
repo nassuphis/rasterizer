@@ -4,7 +4,14 @@ import colorsys
 from scipy.ndimage import gaussian_filter, sobel, laplace, gaussian_laplace, convolve
 import re
 from collections import Counter
-import color_dicts
+try:
+    import color_dicts
+except ModuleNotFoundError:
+    # allow import when loaded via 'from rasterizer import colors' style path tricks
+    from pathlib import Path
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import color_dicts
 
 DEFAULT_GAMMA = 1
 

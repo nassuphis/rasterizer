@@ -1,10 +1,34 @@
 # raster.py
+from __future__ import annotations
+
+from pathlib import Path
+import importlib.util
+import sys  # <-- add
+
+def _load_sibling(name):
+    mod_path = Path(__file__).resolve().with_name(f"{name}.py")
+    mod_spec = importlib.util.spec_from_file_location(f"_{name}_local", mod_path)
+    assert mod_spec and mod_spec.loader
+    mod = importlib.util.module_from_spec(mod_spec)
+    # IMPORTANT: register before exec_module (dataclasses expects this)
+    sys.modules[mod_spec.name] = mod
+    mod_spec.loader.exec_module(mod)
+    return mod
+
+if __name__ == "__main__" and (__package__ is None or __package__ == ""):
+    # running as a standalone script: python ../specparser/expander.py ...
+    autolevels  = _load_sibling("autolevels")
+else:
+    # imported as part of the rasterized package: from rasterizer import autolevels
+    from . import autolevels 
+
 import os
 import math
 import numpy as np
 from numba import njit, prange
 import pyvips as vips
 import subprocess
+import argparse
 
 # ========================================
 # dot stamping
@@ -270,12 +294,12 @@ def add_footer_label(
     text: str,
     *,
     footer_frac: float = 0.02,   # ≈ target glyph height vs H
-    pad_lr_px: int = 40,
+    pad_lr_px: int = 48,
     dpi: int = 300,
     align: str = "centre",
     invert: bool = False,
-    font_family: str = "Courier New",
-    font_weight: str = "Bold",
+    font_family: str = "PT Mono",
+    font_weight: str = "Regular",
     min_px: int = 10,
     max_px_frac: float = 0.05,
     max_retries: int = 8,
@@ -437,44 +461,78 @@ def _make_xmp_packet(spec: str) -> bytes:
 <?xpacket end='w'?>"""
     return xml.encode("utf-8")
 
+autolvlcfg =  autolevels.AutoLevelsRGBConfig(
+        bins=256,
+        clip_low=0.0,
+        clip_high=0.0,
+        peak_factor=0.0,
+        gamma=1.0,
+        auto_gamma="median",
+        target=0.55,
+        sigmoid_strength=3,
+        sigmoid_mid=0.5,
+        vibrance=0.0,
+        pooled_rgb=20,
+        threads=None,
+        quality=95,
+        jpeg_subsample_mode="on",
+        jpeg_optimize_coding=True,
+        jpeg_interlace=True,
+    )
+
+
 def save_jpg_rgb(
     rgb: np.ndarray,
     out_path: str,
-    invert: bool = False,
     footer_text: str | None = None,
     *,
     footer_pad_lr_px: int = 48,
     footer_dpi: int = 300,
     quality: int = 95,
-    progressive: bool = True,
     spec: str | None = None,              # <--- add
-    keep_metadata: bool = True,           # <--- add (or just hardcode strip=False)
+    autolvl: bool = True,
 ) -> None:
     base = np_to_vips_rgb_u8(rgb)
-    if invert:
-        base = base ^ 255
+
+    if autolvl:
+        base_f01 = base.cast("float") / 255.0
+        out_f01 = autolevels.process_image(base_f01, autolvlcfg)
+        base1 = autolevels.float01_to_u8(out_f01)
+    else:
+        base1 = base
 
     if footer_text:
-        base = add_footer_label(
-            base,
+        cc = 250
+        is_r = base1.extract_band(0) > cc
+        is_b = base1.extract_band(1) > cc
+        is_g = base1.extract_band(2) > cc
+        mask = is_r & is_b & is_g
+        white = base1.new_from_image([cc, cc, cc])
+        base1 = mask.ifthenelse(white, base1)
+        base2 = add_footer_label(
+            base1,
             footer_text,
             pad_lr_px=footer_pad_lr_px,
             dpi=footer_dpi,
             align="centre",
             invert=False,
         )
+    else:
+        base2 = base1
 
     # Attach metadata BEFORE write
     if spec is not None:
-        base = base.copy()  # ensure writable metadata
-        base.set_type(vips.GValue.blob_type, "xmp-data", _make_xmp_packet(spec))
-        base.set_type(vips.GValue.gstr_type,"exif-ifd0-UserComment",spec)
+        base3 = base2.copy()  # ensure writable metadata
+        base3.set_type(vips.GValue.blob_type, "xmp-data", _make_xmp_packet(spec))
+        base3.set_type(vips.GValue.gstr_type,"exif-ifd0-UserComment",spec)
+    else:
+        base3 = base2
 
-    base.write_to_file(
+    base3.write_to_file(
         out_path,
         Q=int(quality),
-        strip=(not keep_metadata),       # <-- IMPORTANT
-        interlace=bool(progressive),
+        strip=False,       # <-- IMPORTANT
+        interlace=True,
     )
 
 def save_vips_rgb(
@@ -767,4 +825,66 @@ def warmup_raster_kernels():
     except Exception as e:
         print(f"[jit] raster warmup skipped: {e}")
 
+
+def _footer_test_image(
+    text: str,
+    *,
+    out_path: str = "footer_test.jpg",
+    size: int = 5000,
+    font_family: str = "DejaVu Sans Mono",
+    font_weight: str = "Bold",
+    footer_frac: float = 0.02,
+    pad_lr_px: int = 48,
+    dpi: int = 300,
+    quality: int = 95,
+) -> None:
+    # 3-channel black
+    base = vips.Image.black(size, size).new_from_image([0, 0, 0])
+    base = add_footer_label(
+        base,
+        text,
+        footer_frac=footer_frac,
+        pad_lr_px=pad_lr_px,
+        dpi=dpi,
+        align="centre",
+        invert=False,
+        font_family=font_family,
+        font_weight=font_weight,
+    )
+    base.write_to_file(out_path, Q=int(quality), strip=True)
+
+
+def _main_cli() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--test-footer", type=str, default=None, help="Render footer onto a 5000x5000 black RGB test image.")
+    ap.add_argument("--test-out", type=str, default="footer_test.jpg")
+    ap.add_argument("--test-size", type=int, default=5000)
+    ap.add_argument("--test-font-family", type=str, default="DejaVu Sans Mono")
+    ap.add_argument("--test-font-weight", type=str, default="Bold")
+    ap.add_argument("--test-footer-frac", type=float, default=0.02)
+    ap.add_argument("--test-pad", type=int, default=48)
+    ap.add_argument("--test-dpi", type=int, default=300)
+    ap.add_argument("--test-quality", type=int, default=95)
+    args = ap.parse_args()
+
+    if args.test_footer:
+        _footer_test_image(
+            args.test_footer,
+            out_path=args.test_out,
+            size=args.test_size,
+            font_family=args.test_font_family,
+            font_weight=args.test_font_weight,
+            footer_frac=args.test_footer_frac,
+            pad_lr_px=args.test_pad,
+            dpi=args.test_dpi,
+            quality=args.test_quality,
+        )
+        print(args.test_out)
+        return
+
+    ap.print_help()
+
+
+if __name__ == "__main__":
+    _main_cli()
 
