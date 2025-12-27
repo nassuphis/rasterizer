@@ -36,7 +36,7 @@ def wrap_after_commas(s: str, N: int) -> str:
 
 def text2glyph(txt,max_chars,border):
     wrapped_txt = wrap_after_commas(txt,max_chars)
-    glyph = vips.Image.text(wrapped_txt, dpi=300, font="PT Mono Bold", align="centre",spacing=1)
+    glyph = vips.Image.text(wrapped_txt, dpi=300, font="PT Mono Regular", align="centre",spacing=1)
     bilevel_glyph = (glyph>0).ifthenelse(255, 0)
     w = bilevel_glyph.width
     h = bilevel_glyph.height

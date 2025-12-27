@@ -18,9 +18,11 @@ def _load_sibling(name):
 if __name__ == "__main__" and (__package__ is None or __package__ == ""):
     # running as a standalone script: python ../specparser/expander.py ...
     autolevels  = _load_sibling("autolevels")
+    footer  = _load_sibling("footer")
 else:
     # imported as part of the rasterized package: from rasterizer import autolevels
-    from . import autolevels 
+    from . import autolevels
+    from . import footer 
 
 import os
 import math
@@ -502,21 +504,8 @@ def save_jpg_rgb(
         base1 = base
 
     if footer_text:
-        cc = 250
-        is_r = base1.extract_band(0) > cc
-        is_b = base1.extract_band(1) > cc
-        is_g = base1.extract_band(2) > cc
-        mask = is_r & is_b & is_g
-        white = base1.new_from_image([cc, cc, cc])
-        base1 = mask.ifthenelse(white, base1)
-        base2 = add_footer_label(
-            base1,
-            footer_text,
-            pad_lr_px=footer_pad_lr_px,
-            dpi=footer_dpi,
-            align="centre",
-            invert=False,
-        )
+        glyph = footer.text2glyph(footer_text,40,1.0)
+        base2 = footer.fade_glyph(base1,glyph,0.2,0.1)
     else:
         base2 = base1
 
