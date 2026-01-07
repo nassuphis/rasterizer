@@ -5,6 +5,9 @@ from pathlib import Path
 import importlib.util
 import sys  # <-- add
 
+parent = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(parent))
+
 def _load_sibling(name):
     mod_path = Path(__file__).resolve().with_name(f"{name}.py")
     mod_spec = importlib.util.spec_from_file_location(f"_{name}_local", mod_path)
@@ -19,10 +22,12 @@ if __name__ == "__main__" and (__package__ is None or __package__ == ""):
     # running as a standalone script: python ../specparser/expander.py ...
     autolevels  = _load_sibling("autolevels")
     footer  = _load_sibling("footer")
+    image2spec  = _load_sibling("image2spec")
 else:
     # imported as part of the rasterized package: from rasterizer import autolevels
     from . import autolevels
     from . import footer 
+    from . import image2spec
 
 import os
 import math
@@ -434,47 +439,19 @@ def add_suffix_number(path: str, n: int, width: int = 5) -> str:
     base, ext = os.path.splitext(path)
     return f"{base}_{n:0{width}d}{ext}"
 
-def read_spec_exiftool(path: str) -> str:
-    out = subprocess.check_output(
-        ["exiftool", "-s3", "-XMP-lyapunov:spec", path],
-        text=True,
-    )
-    if out.strip():
-        return out.strip()
-
-    # fallback to EXIF
-    out = subprocess.check_output(
-        ["exiftool", "-s3", "-UserComment", path],
-        text=True,
-    )
-    return out.strip()
-
-def _make_xmp_packet(spec: str) -> bytes:
-    # Pick any stable URI you like for your namespace
-    ns_uri = "https://example.com/lyapunov/1.0/"
-    # Minimal XMP packet with a custom namespace + a single property
-    xml = f"""<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>
-<x:xmpmeta xmlns:x='adobe:ns:meta/'>
- <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
-  <rdf:Description xmlns:lyapunov='{ns_uri}'
-                   lyapunov:spec='{spec}'/>
- </rdf:RDF>
-</x:xmpmeta>
-<?xpacket end='w'?>"""
-    return xml.encode("utf-8")
 
 autolvlcfg =  autolevels.AutoLevelsRGBConfig(
         bins=256,
         clip_low=0.0,
-        clip_high=0.0,
-        peak_factor=0.0,
+        clip_high=1.0,
+        peak_factor=8.0,
         gamma=1.0,
         auto_gamma="median",
         target=0.55,
         sigmoid_strength=3,
         sigmoid_mid=0.5,
-        vibrance=0.0,
-        pooled_rgb=20,
+        vibrance=0.05,
+        pooled_rgb=1,
         threads=None,
         quality=95,
         jpeg_subsample_mode="on",
@@ -493,9 +470,20 @@ def save_jpg_rgb(
     quality: int = 95,
     spec: str | None = None,              # <--- add
     autolvl: bool = True,
+    resize: int | None = None
 ) -> None:
-    base = np_to_vips_rgb_u8(rgb)
-
+    
+    base0 = np_to_vips_rgb_u8(rgb)
+    
+    if resize:
+        w, h = base0.width, base0.height
+        if w <= 0 or h <= 0:
+            raise ValueError(f"Bad image dimensions: {w}x{h}")
+        scale = max(resize / w, resize / h)
+        base = base0.resize(scale, kernel="lanczos3")
+    else:
+        base = base0
+       
     if autolvl:
         base_f01 = base.cast("float") / 255.0
         out_f01 = autolevels.process_image(base_f01, autolvlcfg)
@@ -505,15 +493,13 @@ def save_jpg_rgb(
 
     if footer_text:
         glyph = footer.text2glyph(footer_text,40,1.0)
-        base2 = footer.fade_glyph(base1,glyph,0.2,0.1)
+        base2 = footer.fade_glyph(base1,glyph,0.1,0.05)
     else:
         base2 = base1
 
     # Attach metadata BEFORE write
     if spec is not None:
-        base3 = base2.copy()  # ensure writable metadata
-        base3.set_type(vips.GValue.blob_type, "xmp-data", _make_xmp_packet(spec))
-        base3.set_type(vips.GValue.gstr_type,"exif-ifd0-UserComment",spec)
+        base3 = image2spec.spec2image(base2,spec)
     else:
         base3 = base2
 
@@ -815,62 +801,11 @@ def warmup_raster_kernels():
         print(f"[jit] raster warmup skipped: {e}")
 
 
-def _footer_test_image(
-    text: str,
-    *,
-    out_path: str = "footer_test.jpg",
-    size: int = 5000,
-    font_family: str = "DejaVu Sans Mono",
-    font_weight: str = "Bold",
-    footer_frac: float = 0.02,
-    pad_lr_px: int = 48,
-    dpi: int = 300,
-    quality: int = 95,
-) -> None:
-    # 3-channel black
-    base = vips.Image.black(size, size).new_from_image([0, 0, 0])
-    base = add_footer_label(
-        base,
-        text,
-        footer_frac=footer_frac,
-        pad_lr_px=pad_lr_px,
-        dpi=dpi,
-        align="centre",
-        invert=False,
-        font_family=font_family,
-        font_weight=font_weight,
-    )
-    base.write_to_file(out_path, Q=int(quality), strip=True)
-
-
 def _main_cli() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--test-footer", type=str, default=None, help="Render footer onto a 5000x5000 black RGB test image.")
-    ap.add_argument("--test-out", type=str, default="footer_test.jpg")
-    ap.add_argument("--test-size", type=int, default=5000)
-    ap.add_argument("--test-font-family", type=str, default="DejaVu Sans Mono")
-    ap.add_argument("--test-font-weight", type=str, default="Bold")
-    ap.add_argument("--test-footer-frac", type=float, default=0.02)
-    ap.add_argument("--test-pad", type=int, default=48)
-    ap.add_argument("--test-dpi", type=int, default=300)
-    ap.add_argument("--test-quality", type=int, default=95)
     args = ap.parse_args()
 
-    if args.test_footer:
-        _footer_test_image(
-            args.test_footer,
-            out_path=args.test_out,
-            size=args.test_size,
-            font_family=args.test_font_family,
-            font_weight=args.test_font_weight,
-            footer_frac=args.test_footer_frac,
-            pad_lr_px=args.test_pad,
-            dpi=args.test_dpi,
-            quality=args.test_quality,
-        )
-        print(args.test_out)
-        return
-
+    
     ap.print_help()
 
 

@@ -1,0 +1,29 @@
+Task: OCR a Lyapunov fractal spec string exactly. The output must be a single-line string consisting of comma-separated items. Each item has the form name:value1:value2:... with no whitespace anywhere. Do not add, remove, reorder, or rename items.
+
+The spec string consists of comma-separated items. Each item name appears once and is followed by one or more colon-separated values. The final output must contain no spaces and must be exactly one line.
+
+The slot item has the form slot:<integer> and has exactly one value. The value is a non-negative integer (e.g. slot:1, slot:81).
+
+The map item has at least six values, for example map:nn14:AB:-40:-40:40:40. The first value is the map name, the second is the forcing pattern, and the remaining values define the numeric range. Preserve order exactly.
+
+The m item defines the map formula and has the form m:<expression>. The expression is a syntactically valid Python expression returning a single scalar. Allowed variables are x, r, and l only. Parentheses must match. Allowed operators are +, -, *, and ** only. No implicit multiplication is allowed. Polynomials may appear, for example: l*l*l*l-l*l*l+l*l-l, l**4-l**3, or x*x-l*l.
+
+Only functions from this list are allowed: [{allowed_funcs}]. Function names start with a letter and may contain digits after the first character. Function names must match exactly and must not be invented. Every function must be called with the correct number of arguments as defined in: {describe_functions(functions.NS)}.
+
+All function arguments are variables or expressions using variables, except for the special functions legendre(), hermite(), laguerre(), sbessel(), chebt(), chebu(), and jacobi(), which take an integer first argument representing the order. No other functions may take integer arguments.
+
+Inside expressions, the vertical stroke is always the variable l (lowercase L), never the digit 1. The digit 1 must never appear as a variable. Forbidden patterns include sin(1*l), sin(1*l-1), cos(1*l), or similar. Correct forms are sin(l*l), sin(l*l-l), and cos(l*l). Be especially careful not to confuse l with 1, and not to confuse i0s with i1s.
+
+The only allowed complex numeric literal is 1j, written with the digit 1. No other numeric complex constants are allowed.
+
+The rgb item describes colorization and has the form rgb:scheme:paletteA:paletteB:gamma:s1=<float>:s2=<float>:s3=<float>:se=<float>. Preserve this order exactly. Palette names must be valid.
+
+The hist item has exactly three values and the form hist:<int>:<int>:<int>. The first two integers are between 1 and 9 inclusive. The third integer is typically three to four digits (e.g. 256, 512, 5120). It must have exactly three values.
+
+The source item is a filename. All valid filename characters are allowed, including underscores. The source value must be a valid filename and contain no spaces.
+
+Formatting rules: output a single line only, with no spaces anywhere. Items are separated by commas. Do not include line breaks or extra characters.
+
+Validation rules: parentheses must match; all functions must exist and have correct arity; no 1*l or similar patterns may appear; only 1j may use digit 1; slot has exactly one value; hist has exactly three values; stone_ocean_magenta is invalid and must be replaced with ocean_pearl_magenta; the source value must be a valid filename; special-function integer-argument rules must be respected.
+
+Output: raw string only, no markdown, no commentary, no explanation.
