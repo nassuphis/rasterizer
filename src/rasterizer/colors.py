@@ -4,14 +4,7 @@ import colorsys
 from scipy.ndimage import gaussian_filter, sobel, laplace, gaussian_laplace, convolve
 import re
 from collections import Counter
-try:
-    import color_dicts
-except ModuleNotFoundError:
-    # allow import when loaded via 'from rasterizer import colors' style path tricks
-    from pathlib import Path
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import color_dicts
+from . import color_dicts
 
 DEFAULT_GAMMA = 1
 
@@ -79,6 +72,14 @@ def _hist_equalize(values: np.ndarray, nbins: int = 256) -> np.ndarray:
 
     if (not math.isfinite(vmin)) or (not math.isfinite(vmax)) or vmax <= vmin:
         return np.zeros_like(values, dtype=np.float64)
+
+    # Check if range is too small for the requested number of bins
+    # (np.histogram fails if bin_width < float precision)
+    value_range = vmax - vmin
+    min_bin_width = value_range / nbins
+    if min_bin_width < np.finfo(np.float64).eps * max(abs(vmin), abs(vmax), 1.0) * nbins:
+        # Range too small - return uniform 0.5 (middle of [0,1])
+        return np.full_like(values, 0.5, dtype=np.float64)
 
     hist, bin_edges = np.histogram(values, bins=nbins, range=(vmin, vmax))
     cdf = hist.cumsum().astype(np.float64)

@@ -29,18 +29,22 @@
 \newpage
 \section{Rasterizer Overview}
 
-The \texttt{raster.py} module turns a cloud of points (typically complex
+The \texttt{rasterizer} package turns a cloud of points (typically complex
 numbers in the plane) into high-quality, bilevel (0/255) PNG images.  It is
-organised around three main stages:
+organised into focused submodules, each handling a distinct stage of the
+pipeline:
 
 \begin{enumerate}
-  \item \emph{Dot stamping}: generate small circular ``stamps'' and apply them
+  \item \emph{Dot stamping} (\texttt{canvas.py}): generate small circular ``stamps'' and apply them
         at many point locations, in a Numba-accelerated loop.
-  \item \emph{Radius bucketing}: group points by dot radius so that stamps can
+  \item \emph{Radius bucketing} (\texttt{canvas.py}): group points by dot radius so that stamps can
         be reused efficiently.
-  \item \emph{Projection and output}: map complex points to pixel
-        coordinates, convert the canvas to a \texttt{pyvips} image, optionally
-        add labels and a passepartout, and write a 1-bit PNG (or a mosaic).
+  \item \emph{Format conversion} (\texttt{formats.py}): bridge between NumPy arrays and
+        \texttt{pyvips} images.
+  \item \emph{Composition} (\texttt{compose.py}): add labels, passepartout frames, and
+        other visual effects.
+  \item \emph{Output} (\texttt{export.py}): write PNG, JPEG, or VIPS files, and
+        compose mosaics.
 \end{enumerate}
 
 Conceptually, you start with a complex vector $z$, project it onto a
@@ -48,8 +52,41 @@ square canvas, choose a dot radius for each point, group the points by
 radius, stamp discs for each group, and then hand the resulting NumPy
 array to \texttt{pyvips} for final rendering and saving.
 
+\subsection{Module Structure}
+
+The package is organised into the following submodules:
+
+\begin{itemize}
+  \item \texttt{canvas.py} -- Point stamping, radius bucketing, coordinate projection, JIT warmup
+  \item \texttt{formats.py} -- NumPy $\leftrightarrow$ PyVIPS conversions
+  \item \texttt{compose.py} -- Footer labels, rounded passepartout, image padding
+  \item \texttt{export.py} -- File output (PNG, JPEG, VIPS) and mosaic creation
+  \item \texttt{raster.py} -- Re-exports all public functions for backwards compatibility
+\end{itemize}
+
+\subsection{Import Styles}
+
+Direct submodule imports (preferred for new code):
+
+\begin{tcolorbox}[enhanced, colback=black!2, colframe=black!50]
+\begin{verbatim}
+from rasterizer.canvas import stamp_points, bucket_by_radius
+from rasterizer.formats import np_to_vips_gray_u8
+from rasterizer.compose import add_footer_label
+from rasterizer.export import save_png_bilevel
+\end{verbatim}
+\end{tcolorbox}
+
+Legacy imports (backwards compatible):
+
+\begin{tcolorbox}[enhanced, colback=black!2, colframe=black!50]
+\begin{verbatim}
+from rasterizer.raster import stamp_points, save_png_bilevel
+\end{verbatim}
+\end{tcolorbox}
+
 \newpage
-\section{Dot Stamping}
+\section{Dot Stamping (\texttt{canvas.py})}
 
 Dot stamping converts each point into a filled disc on a 2-D canvas.
 A disc is represented by two integer offset arrays \texttt{(dy, dx)}. These
@@ -168,7 +205,7 @@ In practice, you call \verb|stamp_points| once per radius bucket: all points
 in the same bucket share the same stencil \verb|(dy, dx)|.
 
 \newpage
-\section{Radius Bucketing}
+\section{Radius Bucketing (\texttt{canvas.py})}
 
 Radius bucketing groups points by dot radius so that each radius is stamped
 in a single batch. This is faster than stamping each point individually with
@@ -383,7 +420,7 @@ difference is that the histogram and scatter phases are block-parallel and
 avoid atomics by precomputing disjoint write ranges.
 
 \newpage
-\section{Projection and Canvas}
+\section{Projection and Canvas (\texttt{canvas.py})}
 
 Once you know where the dots live in the complex plane, you need to map
 them to integer pixel coordinates in a square canvas.
@@ -398,7 +435,7 @@ pixel coordinates in a square image of size \verb|pix|:
 def project_to_canvas(z: np.ndarray, pix: int, margin_frac: float):
     if z.size < 1:
         return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.int32)
-    half = (0.5 * max(np.ptp(z.real), np.ptp(z.imag))) * (1.0 + 2.0 * margin_frac)
+    half = np.max(np.abs(z)) * (1.0 + 2.0 * margin_frac)
     span  = 2.0 * half
     if span < 1e-10:
         span = 1
@@ -414,9 +451,9 @@ def project_to_canvas(z: np.ndarray, pix: int, margin_frac: float):
 Explanation:
 
 \begin{itemize}
-  \item \verb|np.ptp(z.real)| and \verb|np.ptp(z.imag)| are the real and
-        imaginary ranges of the point cloud.
-  \item \verb|half| is half of the larger range, scaled by
+  \item \verb|np.max(np.abs(z))| finds the maximum distance from the origin
+        in the point cloud.
+  \item \verb|half| is this maximum distance, scaled by
         \verb|(1 + 2 * margin_frac)| to leave space around the points.
   \item The complex plane is mapped to a square window
         $[-\texttt{half}, +\texttt{half}] \times [-\texttt{half}, +\texttt{half}]$.
@@ -439,7 +476,7 @@ def render_to_canvas(z: np.ndarray, pix: int, margin_frac: float):
 \end{tcolorbox}
 
 \newpage
-\section{NumPy \texorpdfstring{$\rightarrow$}{->} VIPS Bridge}
+\section{NumPy \texorpdfstring{$\rightarrow$}{->} VIPS Bridge (\texttt{formats.py})}
 
 \subsection{Wrapping NumPy as a VIPS Image}
 
@@ -467,7 +504,7 @@ Points:
 This is the bridge used by all later functions that operate on VIPS images.
 
 \newpage
-\section{Footer Labels}
+\section{Footer Labels (\texttt{compose.py})}
 
 \subsection{Dynamic Footer Rendering}
 
@@ -482,12 +519,12 @@ def add_footer_label(
     text: str,
     *,
     footer_frac: float = 0.02,   # ~ target glyph height vs H
-    pad_lr_px: int = 40,
+    pad_lr_px: int = 48,
     dpi: int = 300,
     align: str = "centre",
     invert: bool = False,
-    font_family: str = "Courier New",
-    font_weight: str = "Bold",
+    font_family: str = "PT Mono",
+    font_weight: str = "Regular",
     min_px: int = 10,
     max_px_frac: float = 0.05,
     max_retries: int = 8,
@@ -525,7 +562,7 @@ If a valid font size cannot be found within \verb|max_retries| attempts,
 the function returns the original image unchanged.
 
 \newpage
-\section{Rounded Passepartout}
+\section{Rounded Passepartout (\texttt{compose.py})}
 
 \subsection{Automatic Mat and Rounded Window}
 
@@ -587,7 +624,7 @@ The result is a square, bilevel image with a clean rounded window around
 the content, centred within a solid mat.
 
 \newpage
-\section{Saving PNGs and Mosaics}
+\section{Saving PNGs and Mosaics (\texttt{export.py})}
 
 \subsection{Saving a Single Bilevel PNG}
 
@@ -764,10 +801,10 @@ Behaviour summary:
 \end{itemize}
 
 \newpage
-\section{JIT Warmup}
+\section{JIT Warmup (\texttt{canvas.py})}
 
-To avoid paying Numba compilation cost on the first “real” render, the
-module provides a lightweight warmup function:
+To avoid paying Numba compilation cost on the first "real" render, the
+\texttt{canvas} module provides a lightweight warmup function:
 
 \begin{tcolorbox}[breakable, enhanced, colback=black!2, colframe=black!50]
 \begin{verbatim}

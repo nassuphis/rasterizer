@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pyvips as vips
 import subprocess
-import argparse
+
 
 # -------------------------------------
 # spec -> xml
